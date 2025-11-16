@@ -1,0 +1,19 @@
+[project]
+name = "cloud-point-2d-converter"
+version = "0.1.0"
+description = "Clud potint to 2D converter"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "laspy>=2.6.1",
+    "matplotlib>=3.10.7",
+    "networkx>=3.5",
+    "numba>=0.62.1",
+    "numpy>=2.3.4",
+    "open3d>=0.19.0",
+    "opencv-python>=4.11.0.86",
+    "pyrender>=0.1.45",
+    "rtree>=1.4.1",
+    "scipy>=1.16.3",
+    "trimesh[easy]>=4.9.0",
+]
