@@ -553,7 +553,29 @@ def main(point_cloud_path, camera_position=None, look_at_point=None):
 # ---------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Użycie: python main_simplified.py <plik.ply>")
+        print("Użycie: uv run main.py <plik.ply> [camera_x camera_y camera_z look_at_x look_at_y look_at_z]")
         sys.exit(1)
     
-    main(sys.argv[1])
+    # Domyślne wartości
+    camera_position = None
+    look_at_point = None
+    
+    # Jeśli podano koordynaty kamery
+    if len(sys.argv) >= 8:
+        try:
+            camera_position = np.array([
+                float(sys.argv[2]),  # camera_x
+                float(sys.argv[3]),  # camera_y  
+                float(sys.argv[4])   # camera_z
+            ])
+            look_at_point = np.array([
+                float(sys.argv[5]),  # look_at_x
+                float(sys.argv[6]),  # look_at_y
+                float(sys.argv[7])   # look_at_z
+            ])
+            print(f"Ustawiono kamerę: pozycja={camera_position}, cel={look_at_point}")
+        except ValueError:
+            print("Błąd: Koordynaty muszą być liczbami")
+            sys.exit(1)
+    
+    main(sys.argv[1], camera_position, look_at_point)
