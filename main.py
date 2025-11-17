@@ -36,8 +36,8 @@ except ImportError:
 # ---------------------
 class Config:
     OUTPUT_DIR = "./output"
-    VOXEL_SIZE = 0.002  # Zwiększono z 0.001 dla dużych zbiorów
-    POISSON_DEPTH = 7  # Bezpieczna wartość
+    VOXEL_SIZE = 0.002
+    POISSON_DEPTH = 7
     VISIBILITY_THRESHOLD = 0.1
     IMAGE_WIDTH = 1920
     IMAGE_HEIGHT = 1080
@@ -46,11 +46,31 @@ class Config:
     Z_LIFT = 5  # mm
     USE_PARALLEL = True
     MAX_WORKERS = min(4, cpu_count())
-    # Nowe parametry dla jakości
-    MIN_TRIANGLES = 15000  # Minimum trójkątów w finalnym meshu
-    MAX_TRIANGLES = 60000  # Maximum trójkątów w finalnym meshu
-    SMOOTHING_ITERATIONS = 2  # Liczba iteracji wygładzania
-    MAX_POINTS_FOR_ORIENT = 100000  # Max punktów dla orient_normals (qhull limit)
+    MIN_TRIANGLES = 15000
+    MAX_TRIANGLES = 60000
+    SMOOTHING_ITERATIONS = 2
+    MAX_POINTS_FOR_ORIENT = 100000
+    
+    # NOWE: Parametry robota i kartki papieru
+    PAPER_FORMAT = "A4"  # "A4" lub "A5"
+    ROBOT_WORKSPACE_X = 300.0  # mm - maksymalny zakres X robota (przykład)
+    ROBOT_WORKSPACE_Y = 300.0  # mm - maksymalny zakres Y robota
+    ROBOT_WORKSPACE_Z = 100.0  # mm - maksymalny zakres Z robota
+    ROBOT_SAFE_Z = 50.0        # mm - bezpieczna wysokość dla travel moves
+    
+    # Wymiary kartek (w mm)
+    PAPER_SIZES = {
+        "A4": (210.0, 297.0),   # Szerokość x Wysokość
+        "A5": (148.0, 210.0),
+        "A3": (297.0, 420.0),
+        "A6": (105.0, 148.0)
+    }
+    
+    # Marginesy na kartce (w mm)
+    PAPER_MARGIN = 10.0  # odstęp od krawędzi kartki
+    
+    # Orientacja kartki
+    PAPER_LANDSCAPE = False  # False = pionowo (portrait), True = poziomo (landscape)
 
 # ---------------------
 # Dekorator mierzący czas
@@ -852,7 +872,150 @@ def export_robot_data(lines_3d, output_dir):
     print(f"  - ~{(drawing_time + travel_time)/60:.1f} min czasu")
 
 # ---------------------
-# Główna funkcja (zaktualizowana - lepsze wybieranie algorytmu)
+# Funkcja skalująca mesh do wymiarów kartki
+# ---------------------
+@measure_time
+def scale_mesh_to_paper(mesh):
+    """Skaluje i centruje mesh do wymiaru kartki papieru"""
+    
+    # Pobierz wymiary kartki
+    paper_width, paper_height = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+    
+    # Orientacja
+    if Config.PAPER_LANDSCAPE:
+        paper_width, paper_height = paper_height, paper_width
+        orientation = "landscape"
+    else:
+        orientation = "portrait"
+    
+    # Uwzględnij marginesy
+    usable_width = paper_width - 2 * Config.PAPER_MARGIN
+    usable_height = paper_height - 2 * Config.PAPER_MARGIN
+    
+    print(f"\n{'='*60}")
+    print(f"SKALOWANIE DO KARTKI {Config.PAPER_FORMAT} ({orientation})")
+    print(f"  • Rozmiar kartki: {paper_width:.1f} x {paper_height:.1f} mm")
+    print(f"  • Marginesy: {Config.PAPER_MARGIN:.1f} mm")
+    print(f"  • Obszar rysowania: {usable_width:.1f} x {usable_height:.1f} mm")
+    print(f"{'='*60}\n")
+    
+    # Pobierz bbox oryginalnego meshu
+    bbox = mesh.get_axis_aligned_bounding_box()
+    extent = bbox.get_extent()
+    center = bbox.get_center()
+    
+    print(f"Oryginalny mesh:")
+    print(f"  • Wymiary: [{extent[0]:.3f} x {extent[1]:.3f} x {extent[2]:.3f}]")
+    print(f"  • Centrum: [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]")
+    
+    # Oblicz współczynnik skalowania (zachowaj proporcje)
+    # Skalujemy tylko X i Y (płaszczyzna rysowania)
+    scale_x = usable_width / extent[0] if extent[0] > 0 else 1.0
+    scale_y = usable_height / extent[1] if extent[1] > 0 else 1.0
+    scale_xy = min(scale_x, scale_y)  # Zachowaj proporcje
+    
+    # Z skalujemy osobno (wysokość obiektu)
+    max_z_height = Config.ROBOT_WORKSPACE_Z - Config.ROBOT_SAFE_Z - 10.0  # -10mm bufor
+    scale_z = max_z_height / extent[2] if extent[2] > 0 else 1.0
+    
+    # Użyj mniejszego skalowania dla Z (nie chcemy za wysokiego)
+    scale_z = min(scale_z, scale_xy)
+    
+    print(f"\nWspółczynniki skalowania:")
+    print(f"  • X,Y: {scale_xy:.6f}x")
+    print(f"  • Z: {scale_z:.6f}x")
+    
+    # Zastosuj skalowanie
+    vertices = np.asarray(mesh.vertices)
+    
+    # 1. Przesuń do początku układu współrzędnych (0,0,0)
+    vertices = vertices - center
+    
+    # 2. Skaluj
+    vertices[:, 0] *= scale_xy  # X
+    vertices[:, 1] *= scale_xy  # Y
+    vertices[:, 2] *= scale_z   # Z
+    
+    # 3. Przesuń do centrum kartki (z marginesem)
+    offset_x = paper_width / 2.0
+    offset_y = paper_height / 2.0
+    offset_z = Config.ROBOT_SAFE_Z + 5.0  # Zacznij 5mm nad powierzchnią
+    
+    vertices[:, 0] += offset_x
+    vertices[:, 1] += offset_y
+    vertices[:, 2] += offset_z
+    
+    # 4. Upewnij się że Z jest zawsze dodatnie
+    min_z = np.min(vertices[:, 2])
+    if min_z < offset_z:
+        vertices[:, 2] += (offset_z - min_z)
+    
+    # Zaktualizuj mesh
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    
+    # Nowy bbox
+    new_bbox = mesh.get_axis_aligned_bounding_box()
+    new_extent = new_bbox.get_extent()
+    new_center = new_bbox.get_center()
+    
+    print(f"\nPrzeskalowany mesh:")
+    print(f"  • Wymiary: [{new_extent[0]:.1f} x {new_extent[1]:.1f} x {new_extent[2]:.1f}] mm")
+    print(f"  • Centrum: [{new_center[0]:.1f}, {new_center[1]:.1f}, {new_center[2]:.1f}] mm")
+    
+    # Sprawdź czy mieści się w workspace robota
+    min_pt = new_bbox.get_min_bound()
+    max_pt = new_bbox.get_max_bound()
+    
+    print(f"\nZakres współrzędnych (mm):")
+    print(f"  • X: [{min_pt[0]:.1f}, {max_pt[0]:.1f}] (workspace: 0 - {Config.ROBOT_WORKSPACE_X:.1f})")
+    print(f"  • Y: [{min_pt[1]:.1f}, {max_pt[1]:.1f}] (workspace: 0 - {Config.ROBOT_WORKSPACE_Y:.1f})")
+    print(f"  • Z: [{min_pt[2]:.1f}, {max_pt[2]:.1f}] (workspace: 0 - {Config.ROBOT_WORKSPACE_Z:.1f})")
+    
+    # Walidacja
+    warnings = []
+    if max_pt[0] > Config.ROBOT_WORKSPACE_X:
+        warnings.append(f"❌ X przekracza workspace ({max_pt[0]:.1f} > {Config.ROBOT_WORKSPACE_X:.1f})")
+    if max_pt[1] > Config.ROBOT_WORKSPACE_Y:
+        warnings.append(f"❌ Y przekracza workspace ({max_pt[1]:.1f} > {Config.ROBOT_WORKSPACE_Y:.1f})")
+    if max_pt[2] > Config.ROBOT_WORKSPACE_Z:
+        warnings.append(f"❌ Z przekracza workspace ({max_pt[2]:.1f} > {Config.ROBOT_WORKSPACE_Z:.1f})")
+    
+    if warnings:
+        print(f"\n⚠️  OSTRZEŻENIA:")
+        for w in warnings:
+            print(f"  {w}")
+        print(f"  Zwiększ ROBOT_WORKSPACE_* lub zmień format kartki")
+    else:
+        print(f"\n✅ Mesh mieści się w workspace robota!")
+    
+    # Zapisz informacje o skalowaniu
+    scale_info = {
+        "paper_format": Config.PAPER_FORMAT,
+        "paper_orientation": orientation,
+        "paper_size_mm": [float(paper_width), float(paper_height)],
+        "usable_area_mm": [float(usable_width), float(usable_height)],
+        "scale_xy": float(scale_xy),
+        "scale_z": float(scale_z),
+        "mesh_dimensions_mm": [float(new_extent[0]), float(new_extent[1]), float(new_extent[2])],
+        "mesh_center_mm": [float(new_center[0]), float(new_center[1]), float(new_center[2])],
+        "bounds_min_mm": [float(min_pt[0]), float(min_pt[1]), float(min_pt[2])],
+        "bounds_max_mm": [float(max_pt[0]), float(max_pt[1]), float(max_pt[2])],
+        "fits_in_workspace": len(warnings) == 0
+    }
+    
+    scale_info_path = os.path.join(Config.OUTPUT_DIR, "scaling_info.json")
+    with open(scale_info_path, 'w') as f:
+        json.dump(scale_info, f, indent=2)
+    
+    print(f"\nInfo o skalowaniu zapisano: {scale_info_path}")
+    print(f"{'='*60}\n")
+    
+    return mesh
+
+# ---------------------
+# Główna funkcja (zaktualizowana - dodano skalowanie)
 # ---------------------
 @measure_time
 def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=False):
@@ -870,19 +1033,22 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
     # Przetwórz
     clean_points = preprocess_point_cloud(points, Config.VOXEL_SIZE)
     
-    # Zbuduj mesh (z szybszym depth)
+    # Zbuduj mesh
     mesh = build_mesh(clean_points, Config.POISSON_DEPTH)
     
-    # Oblicz centrum i wymiary
+    # ⭐ SKALUJ DO KARTKI PAPIERU ⭐
+    mesh = scale_mesh_to_paper(mesh)
+    
+    # Oblicz centrum i wymiary (po skalowaniu)
     bounds = mesh.get_axis_aligned_bounding_box()
     center = bounds.get_center()
     extent = bounds.get_extent()
     max_extent = np.max(extent)
     
-    print(f"Centrum meshu: {center}")
-    print(f"Wymiary: {extent}")
+    print(f"Centrum meshu (po skalowaniu): {center}")
+    print(f"Wymiary (po skalowaniu): {extent}")
     
-    # Tryb deweloperski - test różnych pozycji kamery
+    # Tryb deweloperski
     if dev_mode:
         print("\n" + "=" * 60)
         print("TRYB DEWELOPERSKI - Testowanie pozycji kamery")
