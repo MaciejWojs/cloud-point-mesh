@@ -37,7 +37,7 @@ except ImportError:
 class Config:
     OUTPUT_DIR = "./output"
     VOXEL_SIZE = 0.002
-    POISSON_DEPTH = 7
+    POISSON_DEPTH = 6
     VISIBILITY_THRESHOLD = 0.1
     IMAGE_WIDTH = 1920
     IMAGE_HEIGHT = 1080
@@ -588,11 +588,11 @@ def optimize_path_kdtree(lines_3d, max_lines=2000):
     return optimized
 
 # ---------------------
-# Renderowanie (naprawione)
+# Renderowanie (NAPRAWIONE - z wizualizacją kartki)
 # ---------------------
 @measure_time
 def render_mesh(mesh, camera_pos, look_at, output_path, lines_3d=None):
-    """Renderuje mesh do obrazu z fallback do wireframe"""
+    """Renderuje mesh do obrazu z wizualizacją kartki i fallback do wireframe"""
     try:
         # Próba Open3D rendering
         os.environ['OPEN3D_CPU_RENDERING'] = 'true'
@@ -600,13 +600,42 @@ def render_mesh(mesh, camera_pos, look_at, output_path, lines_3d=None):
         vis = o3d.visualization.Visualizer()
         vis.create_window(width=Config.IMAGE_WIDTH, height=Config.IMAGE_HEIGHT, visible=False)
         
+        # ⭐ DODAJ: Wizualizację kartki papieru jako ramkę
+        paper_width, paper_height = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+        if Config.PAPER_LANDSCAPE:
+            paper_width, paper_height = paper_height, paper_width
+        
+        # Narysuj ramkę kartki na płaszczyźnie Z=ROBOT_SAFE_Z
+        paper_z = Config.ROBOT_SAFE_Z
+        paper_corners = np.array([
+            [Config.PAPER_MARGIN, Config.PAPER_MARGIN, paper_z],
+            [paper_width - Config.PAPER_MARGIN, Config.PAPER_MARGIN, paper_z],
+            [paper_width - Config.PAPER_MARGIN, paper_height - Config.PAPER_MARGIN, paper_z],
+            [Config.PAPER_MARGIN, paper_height - Config.PAPER_MARGIN, paper_z],
+            [Config.PAPER_MARGIN, Config.PAPER_MARGIN, paper_z]  # Zamknij ramkę
+        ])
+        
+        paper_frame = o3d.geometry.LineSet()
+        paper_frame.points = o3d.utility.Vector3dVector(paper_corners)
+        paper_frame.lines = o3d.utility.Vector2iVector([[i, i+1] for i in range(len(paper_corners)-1)])
+        paper_frame.paint_uniform_color([0, 1, 0])  # Zielona ramka
+        vis.add_geometry(paper_frame)
+        
+        # ⭐ DODAJ: Osie układu współrzędnych dla orientacji
+        axis_length = max(paper_width, paper_height) * 0.3
+        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=axis_length, 
+            origin=[0, 0, paper_z]
+        )
+        vis.add_geometry(coord_frame)
+        
         # Dodaj mesh
         mesh_copy = o3d.geometry.TriangleMesh(mesh)
         mesh_copy.compute_vertex_normals()
         mesh_copy.paint_uniform_color([0.7, 0.7, 0.7])
         vis.add_geometry(mesh_copy)
         
-        # Dodaj linie
+        # Dodaj linie robota
         if lines_3d:
             points = []
             line_indices = []
@@ -617,23 +646,35 @@ def render_mesh(mesh, camera_pos, look_at, output_path, lines_3d=None):
             line_set = o3d.geometry.LineSet()
             line_set.points = o3d.utility.Vector3dVector(points)
             line_set.lines = o3d.utility.Vector2iVector(line_indices)
-            line_set.paint_uniform_color([1, 0, 0])
+            line_set.paint_uniform_color([1, 0, 0])  # Czerwone linie
             vis.add_geometry(line_set)
         
         # Ustaw kamerę
         ctr = vis.get_view_control()
         if ctr is None:
             raise RuntimeError("View control failed")
-            
+        
+        # ⭐ NAPRAWIONE: Ustaw parametry kamery w przestrzeni mm
         vis.poll_events()
         vis.update_renderer()
         
-        forward = (look_at - camera_pos) / np.linalg.norm(look_at - camera_pos)
-        up = np.array([0, 0, 1]) if abs(np.dot(forward, [0, 0, 1])) < 0.9 else np.array([0, 1, 0])
+        # Oblicz wektor forward i up
+        forward = (look_at - camera_pos)
+        forward_len = np.linalg.norm(forward)
+        if forward_len > 0:
+            forward = forward / forward_len
         
+        # Wybierz wektor up - unikaj równoległości z forward
+        if abs(np.dot(forward, [0, 0, 1])) < 0.9:
+            up = np.array([0, 0, 1])
+        else:
+            up = np.array([0, 1, 0])
+        
+        # ⭐ WAŻNE: Ustaw zoom na podstawie odległości w mm
         ctr.set_lookat(look_at)
         ctr.set_front(forward)
         ctr.set_up(up)
+        ctr.set_zoom(0.3)  # Dostosuj zoom dla większej skali mm
         
         vis.poll_events()
         vis.update_renderer()
@@ -646,6 +687,22 @@ def render_mesh(mesh, camera_pos, look_at, output_path, lines_3d=None):
             raise RuntimeError("Empty render buffer")
         
         image_bgr = cv2.cvtColor((image_array * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        
+        # ⭐ DODAJ: Naniesienie info o współrzędnych na obraz
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.rectangle(image_bgr, (10, 10), (500, 150), (0, 0, 0), -1)
+        cv2.putText(image_bgr, f"Camera: [{camera_pos[0]:.0f}, {camera_pos[1]:.0f}, {camera_pos[2]:.0f}] mm", 
+                   (20, 35), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(image_bgr, f"Target: [{look_at[0]:.0f}, {look_at[1]:.0f}, {look_at[2]:.0f}] mm", 
+                   (20, 60), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(image_bgr, f"Distance: {forward_len:.0f} mm", 
+                   (20, 85), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(image_bgr, f"Paper: {Config.PAPER_FORMAT}", 
+                   (20, 110), font, 0.5, (0, 255, 0), 1)
+        if lines_3d:
+            cv2.putText(image_bgr, f"Lines: {len(lines_3d)}", 
+                       (20, 135), font, 0.5, (0, 0, 255), 1)
+        
         cv2.imwrite(output_path, image_bgr)
         print(f"Render 3D zapisany: {output_path}")
         
@@ -654,11 +711,13 @@ def render_mesh(mesh, camera_pos, look_at, output_path, lines_3d=None):
         
     except Exception as e:
         print(f"Błąd renderowania 3D: {e}")
+        import traceback
+        traceback.print_exc()
         print("Przełączam na wireframe 2D...")
         return render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d)
 
 def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
-    """Fallback: renderowanie wireframe 2D"""
+    """Fallback: renderowanie wireframe 2D - NAPRAWIONE dla mm"""
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
     
@@ -668,8 +727,11 @@ def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
         gray = int(30 + (60 - 30) * (y / Config.IMAGE_HEIGHT))
         img[y, :] = [gray, gray, gray]
     
-    # Projekcja
-    view_dir = (look_at - camera_pos) / np.linalg.norm(look_at - camera_pos)
+    # ⭐ NAPRAWIONE: Projekcja uwzględniająca skalę mm
+    view_dir = (look_at - camera_pos)
+    view_len = np.linalg.norm(view_dir)
+    if view_len > 0:
+        view_dir = view_dir / view_len
     
     # Wybierz osie projekcji
     if abs(view_dir[2]) > 0.7:  # Z góry/dołu
@@ -687,17 +749,16 @@ def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
     proj_vertices_clean = proj_vertices[valid_mask]
     
     if len(proj_vertices_clean) == 0:
-        # Fallback do tekstu
         cv2.putText(img, "No valid vertices", (50, Config.IMAGE_HEIGHT//2), 
                    cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
         cv2.imwrite(output_path, img)
         return output_path
     
-    # Skalowanie
+    # ⭐ NAPRAWIONE: Skalowanie uwzględniające rzeczywiste wymiary w mm
     min_vals = np.min(proj_vertices_clean, axis=0)
     max_vals = np.max(proj_vertices_clean, axis=0)
     ranges = max_vals - min_vals
-    ranges = np.where(ranges < 1e-6, 1.0, ranges)
+    ranges = np.where(ranges < 1e-3, 1.0, ranges)  # Zmieniono próg z 1e-6 na 1e-3 (dla mm)
     
     margin = 0.1
     scale = min(Config.IMAGE_WIDTH * (1-2*margin) / ranges[0], 
@@ -709,6 +770,35 @@ def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
     scaled_vertices[:, 1] += Config.IMAGE_HEIGHT // 2
     scaled_vertices = scaled_vertices.astype(int)
     
+    # ⭐ DODAJ: Rysuj ramkę kartki na projekcji
+    paper_width, paper_height = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+    if Config.PAPER_LANDSCAPE:
+        paper_width, paper_height = paper_height, paper_width
+    
+    # Rogi kartki w przestrzeni 3D
+    paper_corners_3d = np.array([
+        [Config.PAPER_MARGIN, Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+        [paper_width - Config.PAPER_MARGIN, Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+        [paper_width - Config.PAPER_MARGIN, paper_height - Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+        [Config.PAPER_MARGIN, paper_height - Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+    ])
+    
+    # Projektuj ramkę
+    if abs(view_dir[2]) > 0.7:
+        paper_corners_2d = paper_corners_3d[:, :2]
+    elif abs(view_dir[1]) > 0.7:
+        paper_corners_2d = paper_corners_3d[:, [0, 2]]
+    else:
+        paper_corners_2d = paper_corners_3d[:, [1, 2]]
+    
+    paper_scaled = (paper_corners_2d - center) * scale
+    paper_scaled[:, 0] += Config.IMAGE_WIDTH // 2
+    paper_scaled[:, 1] += Config.IMAGE_HEIGHT // 2
+    paper_scaled = paper_scaled.astype(int)
+    
+    # Rysuj ramkę kartki
+    cv2.polylines(img, [paper_scaled], True, (0, 255, 0), 2, cv2.LINE_AA)
+    
     # Rysuj trójkąty wireframe
     triangle_count = 0
     for tri in triangles:
@@ -719,9 +809,9 @@ def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
                 triangle_count += 1
     
     # Rysuj linie robota
+    line_count = 0
     if lines_3d:
-        line_count = 0
-        for start_3d, end_3d in lines_3d[:5000]:  # Limit
+        for start_3d, end_3d in lines_3d[:5000]:
             # Projekcja linii
             if abs(view_dir[2]) > 0.7:
                 start_2d = start_3d[:2]
@@ -741,22 +831,28 @@ def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
                 0 <= end_scaled[0] < Config.IMAGE_WIDTH and 0 <= end_scaled[1] < Config.IMAGE_HEIGHT):
                 cv2.line(img, tuple(start_scaled), tuple(end_scaled), (0, 0, 255), 2, cv2.LINE_AA)
                 line_count += 1
-        
-        print(f"Narysowano {line_count} linii robota")
     
-    # Panel informacyjny
-    cv2.rectangle(img, (0, 0), (400, 120), (20, 20, 20), -1)
-    cv2.putText(img, f"Wireframe ({axis_labels[0]}-{axis_labels[1]})", (15, 30), 
+    # Panel informacyjny - rozszerzony
+    cv2.rectangle(img, (0, 0), (500, 200), (20, 20, 20), -1)
+    cv2.putText(img, f"Wireframe 2D ({axis_labels[0]}-{axis_labels[1]})", (15, 30), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(img, f"Vertices: {len(vertices):,}", (15, 55), 
+    cv2.putText(img, f"Vertices: {len(vertices):,}", (15, 60), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    cv2.putText(img, f"Triangles: {triangle_count:,}/{len(triangles):,}", (15, 75), 
+    cv2.putText(img, f"Triangles: {triangle_count:,}/{len(triangles):,}", (15, 85), 
                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     if lines_3d:
-        cv2.putText(img, f"Robot lines: {len(lines_3d):,}", (15, 95), 
+        cv2.putText(img, f"Robot lines: {line_count:,}/{len(lines_3d):,}", (15, 110), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
     
-    print(f"Narysowano {triangle_count} trójkątów wireframe")
+    # Info o kamerze
+    cv2.putText(img, f"Camera: [{camera_pos[0]:.0f}, {camera_pos[1]:.0f}, {camera_pos[2]:.0f}] mm", 
+               (15, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    cv2.putText(img, f"Target: [{look_at[0]:.0f}, {look_at[1]:.0f}, {look_at[2]:.0f}] mm", 
+               (15, 155), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    cv2.putText(img, f"Paper: {Config.PAPER_FORMAT} (green frame)", 
+               (15, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+    
+    print(f"Narysowano {triangle_count} trójkątów wireframe + {line_count} linii robota")
     cv2.imwrite(output_path, img)
     print(f"Wireframe 2D zapisany: {output_path}")
     return output_path
@@ -894,11 +990,11 @@ def export_robot_data(lines_3d, output_dir):
     print(f"    Z: [{min_coords[2]:.1f}, {max_coords[2]:.1f}]")
 
 # ---------------------
-# Funkcja skalująca mesh do wymiarów kartki
+# Funkcja skalująca mesh do wymiarów kartki (NAPRAWIONA - zachowuje proporcje)
 # ---------------------
 @measure_time
 def scale_mesh_to_paper(mesh):
-    """Skaluje i centruje mesh do wymiaru kartki papieru"""
+    """Skaluje i centruje mesh do wymiaru kartki papieru - ZACHOWUJE PROPORCJE"""
     
     # Pobierz wymiary kartki
     paper_width, paper_height = Config.PAPER_SIZES[Config.PAPER_FORMAT]
@@ -927,25 +1023,31 @@ def scale_mesh_to_paper(mesh):
     center = bbox.get_center()
     
     print(f"Oryginalny mesh:")
-    print(f"  • Wymiary: [{extent[0]:.3f} x {extent[1]:.3f} x {extent[2]:.3f}]")
-    print(f"  • Centrum: [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]")
+    print(f"  • Wymiary: [{extent[0]:.6f} x {extent[1]:.6f} x {extent[2]:.6f}]")
+    print(f"  • Centrum: [{center[0]:.6f}, {center[1]:.6f}, {center[2]:.6f}]")
+    print(f"  • Proporcje X:Y:Z = 1:{extent[1]/extent[0]:.3f}:{extent[2]/extent[0]:.3f}")
     
-    # Oblicz współczynnik skalowania (zachowaj proporcje)
-    # Skalujemy tylko X i Y (płaszczyzna rysowania)
-    scale_x = usable_width / extent[0] if extent[0] > 0 else 1.0
-    scale_y = usable_height / extent[1] if extent[1] > 0 else 1.0
-    scale_xy = min(scale_x, scale_y)  # Zachowaj proporcje
+    # ⭐ KLUCZOWE: Oblicz JEDEN współczynnik skalowania dla WSZYSTKICH osi
+    # aby zachować proporcje obiektu
     
-    # Z skalujemy osobno (wysokość obiektu)
-    max_z_height = Config.ROBOT_WORKSPACE_Z - Config.ROBOT_SAFE_Z - 10.0  # -10mm bufor
-    scale_z = max_z_height / extent[2] if extent[2] > 0 else 1.0
+    # Znajdź największy wymiar w płaszczyźnie XY
+    max_xy_extent = max(extent[0], extent[1])
     
-    # Użyj mniejszego skalowania dla Z (nie chcemy za wysokiego)
-    scale_z = min(scale_z, scale_xy)
+    # Oblicz skalę aby zmieścić w obszarze rysowania
+    # (zachowując proporcje, skalujemy wszystko tak samo)
+    scale_factor = min(usable_width / max_xy_extent, usable_height / max_xy_extent)
     
-    print(f"\nWspółczynniki skalowania:")
-    print(f"  • X,Y: {scale_xy:.6f}x")
-    print(f"  • Z: {scale_z:.6f}x")
+    # Sprawdź czy Z po przeskalowaniu nie będzie za wysokie
+    scaled_z = extent[2] * scale_factor
+    max_allowed_z = Config.ROBOT_WORKSPACE_Z - Config.ROBOT_SAFE_Z - 10.0
+    
+    if scaled_z > max_allowed_z:
+        # Zmniejsz skalę jeśli Z byłoby za wysokie
+        scale_factor = max_allowed_z / extent[2]
+        print(f"  ⚠️  Dostosowano skalę ze względu na wysokość Z")
+    
+    print(f"\nWspółczynnik skalowania (jednolity dla X,Y,Z): {scale_factor:.6f}x")
+    print(f"  • Po skalowaniu: [{extent[0]*scale_factor:.1f} x {extent[1]*scale_factor:.1f} x {extent[2]*scale_factor:.1f}] mm")
     
     # Zastosuj skalowanie
     vertices = np.asarray(mesh.vertices)
@@ -953,24 +1055,28 @@ def scale_mesh_to_paper(mesh):
     # 1. Przesuń do początku układu współrzędnych (0,0,0)
     vertices = vertices - center
     
-    # 2. Skaluj
-    vertices[:, 0] *= scale_xy  # X
-    vertices[:, 1] *= scale_xy  # Y
-    vertices[:, 2] *= scale_z   # Z
+    # 2. Skaluj RÓWNOMIERNIE wszystkie osie (zachowaj proporcje!)
+    vertices = vertices * scale_factor
     
-    # 3. Przesuń do centrum kartki (z marginesem)
+    # 3. Oblicz centrum kartki
     offset_x = paper_width / 2.0
     offset_y = paper_height / 2.0
-    offset_z = Config.ROBOT_SAFE_Z + 5.0  # Zacznij 5mm nad powierzchnią
     
+    # 4. Oblicz offset Z - dno obiektu ma być na ROBOT_SAFE_Z
+    scaled_extent = extent * scale_factor
+    offset_z = Config.ROBOT_SAFE_Z + scaled_extent[2] / 2.0  # Środek obiektu na SAFE_Z + połowa wysokości
+    
+    # 5. Przesuń do centrum kartki
     vertices[:, 0] += offset_x
     vertices[:, 1] += offset_y
     vertices[:, 2] += offset_z
     
-    # 4. Upewnij się że Z jest zawsze dodatnie
+    # 6. Upewnij się że dno jest na ROBOT_SAFE_Z
     min_z = np.min(vertices[:, 2])
-    if min_z < offset_z:
-        vertices[:, 2] += (offset_z - min_z)
+    if min_z < Config.ROBOT_SAFE_Z:
+        adjustment = Config.ROBOT_SAFE_Z - min_z
+        vertices[:, 2] += adjustment
+        print(f"  • Dostosowano Z o +{adjustment:.1f}mm aby dno było na ROBOT_SAFE_Z")
     
     # Zaktualizuj mesh
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
@@ -985,6 +1091,7 @@ def scale_mesh_to_paper(mesh):
     print(f"\nPrzeskalowany mesh:")
     print(f"  • Wymiary: [{new_extent[0]:.1f} x {new_extent[1]:.1f} x {new_extent[2]:.1f}] mm")
     print(f"  • Centrum: [{new_center[0]:.1f}, {new_center[1]:.1f}, {new_center[2]:.1f}] mm")
+    print(f"  • Proporcje zachowane: X:Y:Z = 1:{new_extent[1]/new_extent[0]:.3f}:{new_extent[2]/new_extent[0]:.3f}")
     
     # Sprawdź czy mieści się w workspace robota
     min_pt = new_bbox.get_min_bound()
@@ -997,12 +1104,22 @@ def scale_mesh_to_paper(mesh):
     
     # Walidacja
     warnings = []
-    if max_pt[0] > Config.ROBOT_WORKSPACE_X:
-        warnings.append(f"❌ X przekracza workspace ({max_pt[0]:.1f} > {Config.ROBOT_WORKSPACE_X:.1f})")
-    if max_pt[1] > Config.ROBOT_WORKSPACE_Y:
-        warnings.append(f"❌ Y przekracza workspace ({max_pt[1]:.1f} > {Config.ROBOT_WORKSPACE_Y:.1f})")
-    if max_pt[2] > Config.ROBOT_WORKSPACE_Z:
-        warnings.append(f"❌ Z przekracza workspace ({max_pt[2]:.1f} > {Config.ROBOT_WORKSPACE_Z:.1f})")
+    if min_pt[0] < 0 or max_pt[0] > Config.ROBOT_WORKSPACE_X:
+        warnings.append(f"❌ X poza workspace [{min_pt[0]:.1f}, {max_pt[0]:.1f}]")
+    if min_pt[1] < 0 or max_pt[1] > Config.ROBOT_WORKSPACE_Y:
+        warnings.append(f"❌ Y poza workspace [{min_pt[1]:.1f}, {max_pt[1]:.1f}]")
+    if min_pt[2] < 0 or max_pt[2] > Config.ROBOT_WORKSPACE_Z:
+        warnings.append(f"❌ Z poza workspace [{min_pt[2]:.1f}, {max_pt[2]:.1f}]")
+    
+    # Sprawdź czy mesh wypełnia rozsądnie kartkę
+    fill_x = new_extent[0] / usable_width * 100
+    fill_y = new_extent[1] / usable_height * 100
+    print(f"\nWypełnienie kartki:")
+    print(f"  • X: {fill_x:.1f}% obszaru")
+    print(f"  • Y: {fill_y:.1f}% obszaru")
+    
+    if fill_x < 30 or fill_y < 30:
+        print(f"  ⚠️  Obiekt zajmuje mało miejsca - można zwiększyć skalę")
     
     if warnings:
         print(f"\n⚠️  OSTRZEŻENIA:")
@@ -1018,13 +1135,15 @@ def scale_mesh_to_paper(mesh):
         "paper_orientation": orientation,
         "paper_size_mm": [float(paper_width), float(paper_height)],
         "usable_area_mm": [float(usable_width), float(usable_height)],
-        "scale_xy": float(scale_xy),
-        "scale_z": float(scale_z),
+        "scale_factor": float(scale_factor),
+        "original_dimensions": [float(extent[0]), float(extent[1]), float(extent[2])],
         "mesh_dimensions_mm": [float(new_extent[0]), float(new_extent[1]), float(new_extent[2])],
         "mesh_center_mm": [float(new_center[0]), float(new_center[1]), float(new_center[2])],
         "bounds_min_mm": [float(min_pt[0]), float(min_pt[1]), float(min_pt[2])],
         "bounds_max_mm": [float(max_pt[0]), float(max_pt[1]), float(max_pt[2])],
-        "fits_in_workspace": len(warnings) == 0
+        "fits_in_workspace": len(warnings) == 0,
+        "fill_percentage_x": float(fill_x),
+        "fill_percentage_y": float(fill_y)
     }
     
     scale_info_path = os.path.join(Config.OUTPUT_DIR, "scaling_info.json")
@@ -1037,7 +1156,7 @@ def scale_mesh_to_paper(mesh):
     return mesh
 
 # ---------------------
-# Główna funkcja (zaktualizowana - dodano skalowanie)
+# Główna funkcja (zaktualizowana - NAPRAWIONA kamera po skalowaniu)
 # ---------------------
 @measure_time
 def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=False):
@@ -1061,14 +1180,18 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
     # ⭐ SKALUJ DO KARTKI PAPIERU ⭐
     mesh = scale_mesh_to_paper(mesh)
     
-    # Oblicz centrum i wymiary (po skalowaniu)
+    # ⭐ WAŻNE: Po skalowaniu oblicz NOWE centrum i wymiary (w mm)
     bounds = mesh.get_axis_aligned_bounding_box()
     center = bounds.get_center()
     extent = bounds.get_extent()
+    
+    # ⭐ NAPRAWIONE: max_extent to teraz najdłuższy wymiar w mm (nie jednostkach oryginalnych)
     max_extent = np.max(extent)
     
-    print(f"Centrum meshu (po skalowaniu): {center}")
-    print(f"Wymiary (po skalowaniu): {extent}")
+    print(f"\nPo skalowaniu do kartki:")
+    print(f"  • Centrum meshu: [{center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f}] mm")
+    print(f"  • Wymiary: [{extent[0]:.1f} x {extent[1]:.1f} x {extent[2]:.1f}] mm")
+    print(f"  • Maksymalny wymiar: {max_extent:.1f} mm\n")
     
     # Tryb deweloperski
     if dev_mode:
@@ -1076,33 +1199,45 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
         print("TRYB DEWELOPERSKI - Testowanie pozycji kamery")
         print("=" * 60)
         
-        # Definicje pozycji testowych (względem centrum)
+        # ⭐ NAPRAWIONE: Pozycje testowe używają rzeczywistych wymiarów w mm
+        # Dla kartki A4 (~210x297mm) ustaw kamery na sensownych odległościach
+        
+        # Oblicz bezpieczną odległość kamery (2-3x większy wymiar kartki)
+        safe_distance = max(extent[0], extent[1]) * 2.5  # ~500-750mm dla A4
+        
         test_positions = [
-            # Nazwa, offset kamery, offset celu (opcjonalny)
-            ("front_high", np.array([0, -max_extent*2.5, max_extent*1.5]), None),
-            ("front_mid", np.array([0, -max_extent*2.5, max_extent*0.8]), None),
-            ("front_low", np.array([0, -max_extent*2.5, max_extent*0.3]), None),
+            # Z przodu - różne wysokości
+            ("front_high", np.array([0, -safe_distance, max_extent * 2.0]), None),
+            ("front_mid", np.array([0, -safe_distance, max_extent]), None),
+            ("front_low", np.array([0, -safe_distance, max_extent * 0.5]), None),
             
-            ("side_right", np.array([max_extent*2.5, 0, max_extent*1.0]), None),
-            ("side_left", np.array([-max_extent*2.5, 0, max_extent*1.0]), None),
+            # Z boków
+            ("side_right", np.array([safe_distance, 0, max_extent]), None),
+            ("side_left", np.array([-safe_distance, 0, max_extent]), None),
             
-            ("corner_high", np.array([max_extent*1.8, -max_extent*1.8, max_extent*1.8]), None),
-            ("corner_low", np.array([max_extent*1.8, -max_extent*1.8, max_extent*0.5]), None),
+            # Z rogów - bardziej artystyczne
+            ("corner_high", np.array([safe_distance * 0.7, -safe_distance * 0.7, max_extent * 1.5]), None),
+            ("corner_low", np.array([safe_distance * 0.7, -safe_distance * 0.7, max_extent * 0.3]), None),
             
-            ("top", np.array([0, 0, max_extent*3.0]), None),
+            # Z góry (widok płaski)
+            ("top", np.array([0, 0, safe_distance]), None),
             
-            ("angled_1", np.array([max_extent*1.5, -max_extent*2.0, max_extent*1.2]), None),
-            ("angled_2", np.array([-max_extent*1.5, -max_extent*2.0, max_extent*1.2]), None),
+            # Kąty pod nachyleniem
+            ("angled_1", np.array([safe_distance * 0.6, -safe_distance * 0.8, max_extent * 1.2]), None),
+            ("angled_2", np.array([-safe_distance * 0.6, -safe_distance * 0.8, max_extent * 1.2]), None),
         ]
         
-        for name, cam_offset, target_offset in test_positions:
-            print(f"\n>>> Testowanie pozycji: {name}")
+        print(f"\nBezpieczna odległość kamery: {safe_distance:.1f} mm\n")
+        
+        for idx, (name, cam_offset, target_offset) in enumerate(test_positions, 1):
+            print(f"[{idx}/{len(test_positions)}] Testowanie pozycji: {name}")
             
             cam_pos = center + cam_offset
             look_at = center + target_offset if target_offset is not None else center
             
-            print(f"    Kamera: [{cam_pos[0]:.2f}, {cam_pos[1]:.2f}, {cam_pos[2]:.2f}]")
-            print(f"    Cel: [{look_at[0]:.2f}, {look_at[1]:.2f}, {look_at[2]:.2f}]")
+            print(f"     Kamera: [{cam_pos[0]:.1f}, {cam_pos[1]:.1f}, {cam_pos[2]:.1f}] mm")
+            print(f"     Cel: [{look_at[0]:.1f}, {look_at[1]:.1f}, {look_at[2]:.1f}] mm")
+            print(f"     Odległość: {np.linalg.norm(cam_pos - look_at):.1f} mm")
             
             # Generuj linie
             lines_3d = generate_lines_from_mesh(mesh, cam_pos, Config.VISIBILITY_THRESHOLD)
@@ -1113,49 +1248,58 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
             except ImportError:
                 optimized_lines = optimize_path(lines_3d, max_lines=2000)
             
-            # Renderuj z nazwą zawierającą koordynaty
-            filename = f"render_{name}_cam_{cam_pos[0]:.1f}_{cam_pos[1]:.1f}_{cam_pos[2]:.1f}_target_{look_at[0]:.1f}_{look_at[1]:.1f}_{look_at[2]:.1f}.png"
+            # Renderuj
+            filename = f"render_{name}.png"
             output_path = os.path.join(Config.OUTPUT_DIR, filename)
             
             render_mesh(mesh, cam_pos, look_at, output_path, optimized_lines)
             
-            # Eksportuj dane tylko dla pierwszej pozycji (aby nie spamować)
+            # Eksportuj dane tylko dla pierwszej pozycji
             if name == "front_high":
                 export_robot_data(optimized_lines, Config.OUTPUT_DIR)
                 export_hanwha_commands(optimized_lines, Config.OUTPUT_DIR)
+            
+            print("")
         
         print("\n" + "=" * 60)
-        print(f"Wygenerowano {len(test_positions)} testowych renderingów")
-        print("Sprawdź folder output/ aby wybrać najlepszą pozycję")
+        print(f"✅ Wygenerowano {len(test_positions)} testowych renderingów")
+        print(f"   Sprawdź folder: {Config.OUTPUT_DIR}/")
         print("=" * 60)
         
     else:
         # Tryb normalny
         if camera_position is None:
-            distance = max_extent * 2.5
+            # ⭐ NAPRAWIONE: Auto-kamera używa rzeczywistych wymiarów w mm
+            # Ustaw kamerę na sensownej odległości od kartki
+            safe_distance = max(extent[0], extent[1]) * 2.5  # ~500-750mm dla A4
+            
             camera_position = center + np.array([
-                0,
-                -distance * 0.866,
-                distance * 0.6
+                0,                          # Centralne X
+                -safe_distance * 0.866,     # Y: z przodu (60 stopni)
+                max_extent * 0.8            # Z: lekko powyżej
             ])
             look_at_point = center
-            print(f"Auto-kamera: pozycja={camera_position}, cel={look_at_point}")
-        
-        print(f"Kamera: {camera_position}")
-        print(f"Cel: {look_at_point}")
+            
+            print(f"\nAuto-kamera (mm):")
+            print(f"  • Pozycja: [{camera_position[0]:.1f}, {camera_position[1]:.1f}, {camera_position[2]:.1f}]")
+            print(f"  • Cel: [{look_at_point[0]:.1f}, {look_at_point[1]:.1f}, {look_at_point[2]:.1f}]")
+            print(f"  • Odległość: {np.linalg.norm(camera_position - look_at_point):.1f} mm\n")
+        else:
+            print(f"\nUżywam podanej kamery:")
+            print(f"  • Pozycja: [{camera_position[0]:.1f}, {camera_position[1]:.1f}, {camera_position[2]:.1f}]")
+            print(f"  • Cel: [{look_at_point[0]:.1f}, {look_at_point[1]:.1f}, {look_at_point[2]:.1f}]")
+            print(f"  • Odległość: {np.linalg.norm(camera_position - look_at_point):.1f} mm\n")
         
         # Generuj linie
         lines_3d = generate_lines_from_mesh(mesh, camera_position, Config.VISIBILITY_THRESHOLD)
         
-        # Optymalizuj - wybierz najlepszy algorytm
+        # Optymalizuj
         num_lines = len(lines_3d)
         
         if NUMBA_AVAILABLE:
-            # Numba jest świetne dla małych/średnich zbiorów
             print(f"Używam optymalizacji Numba dla {num_lines} linii")
             optimized_lines = optimize_path(lines_3d, max_lines=2000)
         else:
-            # Fallback do k-d tree (tylko jeśli scipy dostępne)
             try:
                 from scipy.spatial import cKDTree
                 print(f"Używam optymalizacji k-d tree dla {num_lines} linii")
@@ -1164,10 +1308,8 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
                 print(f"Używam standardowej optymalizacji dla {num_lines} linii")
                 optimized_lines = optimize_path(lines_3d, max_lines=2000)
         
-        # Renderuj z koordynatami w nazwie
-        cam_str = f"cam_{camera_position[0]:.1f}_{camera_position[1]:.1f}_{camera_position[2]:.1f}"
-        target_str = f"target_{look_at_point[0]:.1f}_{look_at_point[1]:.1f}_{look_at_point[2]:.1f}"
-        filename = f"render_{cam_str}_{target_str}.png"
+        # Renderuj
+        filename = f"render_output.png"
         
         os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
         render_mesh(mesh, camera_position, look_at_point, 
@@ -1178,10 +1320,14 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
         export_hanwha_commands(optimized_lines, Config.OUTPUT_DIR)
     
     # Zapisz mesh
-    o3d.io.write_triangle_mesh(os.path.join(Config.OUTPUT_DIR, "mesh.ply"), mesh)
-    print(f"Mesh zapisany: {Config.OUTPUT_DIR}/mesh.ply")
+    mesh_path = os.path.join(Config.OUTPUT_DIR, "mesh.ply")
+    o3d.io.write_triangle_mesh(mesh_path, mesh)
+    print(f"\nMesh zapisany: {mesh_path}")
     
-    print("\nGotowe!")
+    print("\n" + "="*60)
+    print("✅ WSZYSTKO GOTOWE!")
+    print(f"   Pliki wyjściowe: {Config.OUTPUT_DIR}/")
+    print("="*60 + "\n")
 
 # ---------------------
 # Entry point
