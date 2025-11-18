@@ -762,7 +762,7 @@ def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
     return output_path
 
 # ---------------------
-# Eksport dla robota Hanwha HCR-3A (zamiast G-code)
+# Eksport dla robota Hanwha HCR-3A (NAPRAWIONY - bez podwójnego mnożenia)
 # ---------------------
 @measure_time
 def export_hanwha_commands(lines_3d, output_dir):
@@ -776,7 +776,8 @@ def export_hanwha_commands(lines_3d, output_dir):
     with open(commands_file, 'w') as f:
         f.write("# Komendy dla robota Hanwha HCR-3A\n")
         f.write(f"# Wygenerowano: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"# Liczba linii: {len(lines_3d)}\n\n")
+        f.write(f"# Liczba linii: {len(lines_3d)}\n")
+        f.write(f"# UWAGA: Współrzędne już w milimetrach (po skalowaniu)\n\n")
         
         # Inicjalizacja
         f.write("ROBOT_INIT\n")
@@ -787,7 +788,7 @@ def export_hanwha_commands(lines_3d, output_dir):
         # Pierwsza pozycja
         first_start = lines_3d[0][0]
         f.write("# Przejście do pozycji startowej\n")
-        f.write(f"MOVE_SAFE {first_start[0]*1000:.3f} {first_start[1]*1000:.3f} {first_start[2]*1000:.3f}\n")
+        f.write(f"MOVE_SAFE {first_start[0]:.3f} {first_start[1]:.3f} {first_start[2]:.3f}\n")  # Bez *1000!
         f.write("PEN_DOWN\n\n")
         
         # Rysowanie linii
@@ -800,11 +801,11 @@ def export_hanwha_commands(lines_3d, output_dir):
                 prev_end = lines_3d[i-2][1]
                 if not np.allclose(start, prev_end, atol=0.001):
                     f.write("PEN_UP\n")
-                    f.write(f"MOVE_FAST {start[0]*1000:.3f} {start[1]*1000:.3f} {start[2]*1000:.3f}\n")
+                    f.write(f"MOVE_FAST {start[0]:.3f} {start[1]:.3f} {start[2]:.3f}\n")  # Bez *1000!
                     f.write("PEN_DOWN\n")
             
             # Rysuj linię
-            f.write(f"DRAW_LINE {end[0]*1000:.3f} {end[1]*1000:.3f} {end[2]*1000:.3f}\n")
+            f.write(f"DRAW_LINE {end[0]:.3f} {end[1]:.3f} {end[2]:.3f}\n")  # Bez *1000!
         
         # Zakończenie
         f.write("\n# Zakończenie\n")
@@ -817,49 +818,66 @@ def export_hanwha_commands(lines_3d, output_dir):
     return commands_file
 
 # ---------------------
-# Eksport danych robota (zaktualizowany - NAPRAWIONY JSON)
+# Eksport danych robota (NAPRAWIONY - współrzędne już w mm)
 # ---------------------
 @measure_time
 def export_robot_data(lines_3d, output_dir):
-    """Eksportuje dane dla robota"""
+    """Eksportuje dane dla robota - współrzędne już w mm po skalowaniu"""
     if not lines_3d:
         return
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Punkty (milimetry)
-    points = np.vstack([[s*1000, e*1000] for s, e in lines_3d])
-    np.savetxt(os.path.join(output_dir, "robot_points_mm.txt"), points, fmt="%.3f")
+    # Punkty (JUŻ W MILIMETRACH - nie mnóż przez 1000!)
+    points = np.vstack([[s, e] for s, e in lines_3d])
+    np.savetxt(os.path.join(output_dir, "robot_points_mm.txt"), points, fmt="%.3f",
+               header="Współrzędne w mm (po skalowaniu do kartki)\nFormat: x y z")
     
-    # Linie (milimetry)
+    # Linie (JUŻ W MILIMETRACH)
     with open(os.path.join(output_dir, "robot_lines_mm.txt"), 'w') as f:
         f.write("# Format: start_x start_y start_z end_x end_y end_z (wszystko w mm)\n")
+        f.write("# UWAGA: Współrzędne już przeskalowane do kartki!\n")
         for s, e in lines_3d:
-            f.write(f"{s[0]*1000:.3f} {s[1]*1000:.3f} {s[2]*1000:.3f} {e[0]*1000:.3f} {e[1]*1000:.3f} {e[2]*1000:.3f}\n")
+            f.write(f"{s[0]:.3f} {s[1]:.3f} {s[2]:.3f} {e[0]:.3f} {e[1]:.3f} {e[2]:.3f}\n")
     
-    # Statystyki - konwertuj wszystko do float (nie numpy float32)
-    total_length = float(sum(np.linalg.norm(e - s) * 1000 for s, e in lines_3d))
+    # Statystyki - współrzędne już w mm, więc NIE mnóż przez 1000
+    total_length = float(sum(np.linalg.norm(e - s) for s, e in lines_3d))
     
     # Oblicz dystans podróży (bez rysowania)
     travel_distance = 0.0
     for i in range(1, len(lines_3d)):
         prev_end = lines_3d[i-1][1]
         curr_start = lines_3d[i][0]
-        travel_distance += float(np.linalg.norm(curr_start - prev_end) * 1000)
+        travel_distance += float(np.linalg.norm(curr_start - prev_end))
     
     drawing_time = total_length / Config.DRAWING_SPEED
     travel_time = travel_distance / Config.TRAVEL_SPEED
     
+    # Sprawdź zakresy współrzędnych
+    all_points = np.vstack([np.vstack([s, e]) for s, e in lines_3d])
+    min_coords = np.min(all_points, axis=0)
+    max_coords = np.max(all_points, axis=0)
+    
     stats = {
-        "total_lines": int(len(lines_3d)),  # int zamiast numpy int
-        "total_drawing_length_mm": round(float(total_length), 2),  # float zamiast numpy float32
+        "total_lines": int(len(lines_3d)),
+        "total_drawing_length_mm": round(float(total_length), 2),
         "total_travel_distance_mm": round(float(travel_distance), 2),
         "estimated_drawing_time_s": round(float(drawing_time), 2),
         "estimated_travel_time_s": round(float(travel_time), 2),
         "estimated_total_time_s": round(float(drawing_time + travel_time), 2),
         "estimated_total_time_min": round(float((drawing_time + travel_time) / 60), 2),
         "drawing_speed_mm_s": int(Config.DRAWING_SPEED),
-        "travel_speed_mm_s": int(Config.TRAVEL_SPEED)
+        "travel_speed_mm_s": int(Config.TRAVEL_SPEED),
+        # Dodano: zakresy współrzędnych
+        "coordinate_ranges_mm": {
+            "x_min": round(float(min_coords[0]), 2),
+            "x_max": round(float(max_coords[0]), 2),
+            "y_min": round(float(min_coords[1]), 2),
+            "y_max": round(float(max_coords[1]), 2),
+            "z_min": round(float(min_coords[2]), 2),
+            "z_max": round(float(max_coords[2]), 2)
+        },
+        "note": "Współrzędne już przeskalowane do kartki (w mm)"
     }
     
     with open(os.path.join(output_dir, "robot_stats.json"), 'w') as f:
@@ -870,6 +888,10 @@ def export_robot_data(lines_3d, output_dir):
     print(f"  - {total_length:.2f}mm rysowania")
     print(f"  - {travel_distance:.2f}mm podróży")
     print(f"  - ~{(drawing_time + travel_time)/60:.1f} min czasu")
+    print(f"\n  Zakresy współrzędnych (mm):")
+    print(f"    X: [{min_coords[0]:.1f}, {max_coords[0]:.1f}]")
+    print(f"    Y: [{min_coords[1]:.1f}, {max_coords[1]:.1f}]")
+    print(f"    Z: [{min_coords[2]:.1f}, {max_coords[2]:.1f}]")
 
 # ---------------------
 # Funkcja skalująca mesh do wymiarów kartki

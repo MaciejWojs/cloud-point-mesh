@@ -5,6 +5,7 @@ description = "Clud potint to 2D converter"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
+    "cupy-cuda12x>=13.6.0",
     "laspy>=2.6.1",
     "matplotlib>=3.10.7",
     "networkx>=3.5",
