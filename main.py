@@ -46,8 +46,8 @@ class Config:
     Z_LIFT = 5  # mm
     USE_PARALLEL = True
     MAX_WORKERS = min(4, cpu_count())
-    MIN_TRIANGLES = 15000
-    MAX_TRIANGLES = 60000
+    MIN_TRIANGLES = 200
+    MAX_TRIANGLES = 1000
     SMOOTHING_ITERATIONS = 2
     MAX_POINTS_FOR_ORIENT = 100000
     
@@ -86,28 +86,51 @@ def measure_time(func):
     return wrapper
 
 # ---------------------
-# Loader chmur punktów (uproszczony)
+# Loader chmur punktów i meshów (inteligentny)
 # ---------------------
 @measure_time
-def load_point_cloud(path):
-    """Wczytuje chmurę punktów"""
+def load_point_cloud_or_mesh(path):
+    """Inteligentnie wczytuje plik - wykrywa czy to mesh czy chmura punktów"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Plik nie istnieje: {path}")
     
     ext = os.path.splitext(path)[1].lower()
     print(f"Wczytywanie {path} (format: {ext})")
     
+    # Najpierw próbuj wczytać jako mesh
+    if ext in (".ply", ".obj", ".stl", ".off", ".gltf", ".glb"):
+        try:
+            mesh = o3d.io.read_triangle_mesh(path)
+            if len(mesh.triangles) > 0:
+                print(f"✅ Wykryto MESH: {len(mesh.vertices)} wierzchołków, {len(mesh.triangles)} trójkątów")
+                
+                # Decymacja jeśli za duży
+                if len(mesh.triangles) > Config.MAX_TRIANGLES:
+                    print(f"⚠️ Mesh zbyt gęsty ({len(mesh.triangles)} trójkątów). Decymacja do {Config.MAX_TRIANGLES}...")
+                    mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=Config.MAX_TRIANGLES)
+                    print(f"   Po decymacji: {len(mesh.vertices)} wierzchołków, {len(mesh.triangles)} trójkątów")
+                
+                return mesh, "mesh"
+        except Exception as e:
+            print(f"   Nie udało się wczytać jako mesh: {e}")
+    
+    # Jeśli nie mesh, wczytaj jako chmurę punktów
+    print(f"   Wczytuję jako chmurę punktów...")
+    
     if ext in (".las", ".laz"):
         import laspy
         las = laspy.open(path, mode='r')
         points = las.read()
         xyz = np.vstack((points.x, points.y, points.z)).T.astype(np.float32)
-        return xyz
+        print(f"✅ Wczytano chmurę punktów: {len(xyz)} punktów")
+        return xyz, "pointcloud"
     else:
         pcd = o3d.io.read_point_cloud(path)
         if not pcd.has_points():
-            raise ValueError("Plik nie zawiera punktów")
-        return np.asarray(pcd.points, dtype=np.float32)
+            raise ValueError("Plik nie zawiera punktów ani meshu")
+        points = np.asarray(pcd.points, dtype=np.float32)
+        print(f"✅ Wczytano chmurę punktów: {len(points)} punktów")
+        return points, "pointcloud"
 
 # ---------------------
 # Przetwarzanie chmury punktów (INTELIGENTNE - NAPRAWIONE)
@@ -1145,6 +1168,9 @@ def scale_mesh_to_paper(mesh):
         "fill_percentage_x": float(fill_x),
         "fill_percentage_y": float(fill_y)
     }
+        
+    # Upewnij się że katalog istnieje
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
     
     scale_info_path = os.path.join(Config.OUTPUT_DIR, "scaling_info.json")
     with open(scale_info_path, 'w') as f:
@@ -1162,20 +1188,47 @@ def scale_mesh_to_paper(mesh):
 def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=False):
     """Główna funkcja"""
     print("=" * 60)
-    print("UPROSZCZONA WERSJA: CHMURA -> MESH -> ROBOT PATH")
+    print("INTELIGENTNA WERSJA: AUTO-DETECT MESH/POINTCLOUD")
     if NUMBA_AVAILABLE:
         print("🚀 NUMBA ACCELERATION ENABLED")
     print("=" * 60)
     
-    # Wczytaj punkty
-    points = load_point_cloud(point_cloud_path)
-    print(f"Wczytano {len(points)} punktów")
+    # Inteligentne wczytywanie - wykryj czy mesh czy chmura
+    data, data_type = load_point_cloud_or_mesh(point_cloud_path)
     
-    # Przetwórz
-    clean_points = preprocess_point_cloud(points, Config.VOXEL_SIZE)
-    
-    # Zbuduj mesh
-    mesh = build_mesh(clean_points, Config.POISSON_DEPTH)
+    if data_type == "mesh":
+        # Gotowy mesh - użyj bezpośrednio!
+        print(f"\n{'='*60}")
+        print("🎯 Wykryto gotowy mesh - pomijam preprocessing!")
+        print(f"{'='*60}\n")
+        mesh = data
+        
+        # Opcjonalnie: delikatna walidacja i czyszczenie
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_unreferenced_vertices()
+        
+        # Upewnij się że są normalne
+        if len(mesh.triangle_normals) == 0:
+            mesh.compute_triangle_normals()
+        if len(mesh.vertex_normals) == 0:
+            mesh.compute_vertex_normals()
+        
+        print(f"Mesh po czyszczeniu: {len(mesh.vertices)} wierzchołków, {len(mesh.triangles)} trójkątów\n")
+    else:
+        # Chmura punktów - pełny pipeline
+        print(f"\n{'='*60}")
+        print("☁️  Chmura punktów - pełny pipeline preprocessing")
+        print(f"{'='*60}\n")
+        points = data
+        print(f"Wczytano {len(points)} punktów")
+        
+        # Przetwórz
+        clean_points = preprocess_point_cloud(points, Config.VOXEL_SIZE)
+        
+        # Zbuduj mesh
+        mesh = build_mesh(clean_points, Config.POISSON_DEPTH)
     
     # ⭐ SKALUJ DO KARTKI PAPIERU ⭐
     mesh = scale_mesh_to_paper(mesh)
@@ -1249,7 +1302,7 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
                 optimized_lines = optimize_path(lines_3d, max_lines=2000)
             
             # Renderuj
-            filename = f"render_{name}.png"
+            filename = f"render_{name}_cam_{cam_pos[0]:.1f}_{cam_pos[1]:.1f}_{cam_pos[2]:.1f}_target_{look_at[0]:.1f}_{look_at[1]:.1f}_{look_at[2]:.1f}.png"
             output_path = os.path.join(Config.OUTPUT_DIR, filename)
             
             render_mesh(mesh, cam_pos, look_at, output_path, optimized_lines)
@@ -1309,7 +1362,7 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
                 optimized_lines = optimize_path(lines_3d, max_lines=2000)
         
         # Renderuj
-        filename = f"render_output.png"
+        filename = f"render_output_cam_{camera_position[0]:.1f}_{camera_position[1]:.1f}_{camera_position[2]:.1f}_target_{look_at_point[0]:.1f}_{look_at_point[1]:.1f}_{look_at_point[2]:.1f}.png"
         
         os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
         render_mesh(mesh, camera_position, look_at_point, 
