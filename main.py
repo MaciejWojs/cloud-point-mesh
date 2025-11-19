@@ -1481,21 +1481,27 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
     else:
         # Tryb normalny
         if camera_position is None:
-            # ⭐ NAPRAWIONE: Auto-kamera używa rzeczywistych wymiarów w mm
-            # Ustaw kamerę na sensownej odległości od kartki
+            # ⭐ DOMYŚLNY WIDOK: TOP (z góry) z rotacją 180°
             safe_distance = max(extent[0], extent[1]) * 2.5  # ~500-750mm dla A4
             
             camera_position = center + np.array([
                 0,                          # Centralne X
-                -safe_distance * 0.866,     # Y: z przodu (60 stopni)
-                max_extent * 0.8            # Z: lekko powyżej
+                0,                          # Centralne Y
+                safe_distance               # Z góry
             ])
             look_at_point = center
             
-            print(f"\nAuto-kamera (mm):")
+            print(f"\n🔄 Auto-kamera: TOP (widok z góry) z rotacją 180°")
             print(f"  • Pozycja: [{camera_position[0]:.1f}, {camera_position[1]:.1f}, {camera_position[2]:.1f}]")
             print(f"  • Cel: [{look_at_point[0]:.1f}, {look_at_point[1]:.1f}, {look_at_point[2]:.1f}]")
             print(f"  • Odległość: {np.linalg.norm(camera_position - look_at_point):.1f} mm\n")
+            
+            # Rotacja meshu o 180° dla widoku z góry
+            print(f"  🔄 Obracam mesh o 180° dla widoku z góry...")
+            mesh_rotated = o3d.geometry.TriangleMesh(mesh)  # Kopia
+            R = mesh_rotated.get_rotation_matrix_from_xyz((0, 0, np.pi))
+            mesh_rotated.rotate(R, center=center)
+            mesh = mesh_rotated
         else:
             print(f"\nUżywam podanej kamery:")
             print(f"  • Pozycja: [{camera_position[0]:.1f}, {camera_position[1]:.1f}, {camera_position[2]:.1f}]")
