@@ -1438,8 +1438,16 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
             print(f"     Cel: [{look_at[0]:.1f}, {look_at[1]:.1f}, {look_at[2]:.1f}] mm")
             print(f"     Odległość: {np.linalg.norm(cam_pos - look_at):.1f} mm")
             
+            # ⭐ ROTACJA: Tylko dla widoku "top" - obrót o 180 stopni
+            mesh_to_use = mesh
+            if name == "top":
+                print(f"     🔄 Obracam mesh o 180° dla widoku z góry...")
+                mesh_to_use = o3d.geometry.TriangleMesh(mesh)  # Kopia
+                R = mesh_to_use.get_rotation_matrix_from_xyz((0, 0, np.pi))
+                mesh_to_use.rotate(R, center=center)
+            
             # Generuj linie
-            lines_3d = generate_lines_from_mesh(mesh, cam_pos, Config.VISIBILITY_THRESHOLD)
+            lines_3d = generate_lines_from_mesh(mesh_to_use, cam_pos, Config.VISIBILITY_THRESHOLD)
             
             # Użyj szybszej optymalizacji
             try:
@@ -1451,12 +1459,12 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
             filename = f"render_{name}_cam_{cam_pos[0]:.1f}_{cam_pos[1]:.1f}_{cam_pos[2]:.1f}_target_{look_at[0]:.1f}_{look_at[1]:.1f}_{look_at[2]:.1f}.png"
             output_path = os.path.join(Config.OUTPUT_DIR, filename)
             
-            render_mesh(mesh, cam_pos, look_at, output_path, optimized_lines)
+            render_mesh(mesh_to_use, cam_pos, look_at, output_path, optimized_lines)
             
             # Generuj SVG (bez statystyk, identyczny jak PNG)
             svg_filename = filename.replace('.png', '.svg')
             svg_output_path = os.path.join(Config.OUTPUT_DIR, svg_filename)
-            generate_svg_from_mesh(mesh, cam_pos, look_at, svg_output_path, optimized_lines)
+            generate_svg_from_mesh(mesh_to_use, cam_pos, look_at, svg_output_path, optimized_lines)
             
             # Eksportuj dane tylko dla pierwszej pozycji
             if name == "front_high":
