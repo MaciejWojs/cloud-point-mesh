@@ -881,6 +881,152 @@ def render_wireframe_2d(mesh, camera_pos, look_at, output_path, lines_3d=None):
     return output_path
 
 # ---------------------
+# Generowanie SVG z siatki
+# ---------------------
+@measure_time
+def generate_svg_from_mesh(mesh, camera_pos, look_at, output_path, lines_3d=None):
+    """
+    Generuje plik SVG z siatki - identyczny jak PNG, ale bez statystyk.
+    Linie są czarne, tło przezroczyste, rozmiar jak kartka papieru.
+    """
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    
+    # Pobierz rozmiar kartki w mm
+    paper_width, paper_height = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+    if Config.PAPER_LANDSCAPE:
+        paper_width, paper_height = paper_height, paper_width
+    
+    # Konwersja mm na punkty (1mm = 3.7795275591 punktów, dla 96 DPI)
+    # Ale SVG używa jednostek użytkownika, więc zostaniemy przy mm
+    svg_width = paper_width
+    svg_height = paper_height
+    
+    # Projekcja - identyczna jak w render_wireframe_2d
+    view_dir = (look_at - camera_pos)
+    view_len = np.linalg.norm(view_dir)
+    if view_len > 0:
+        view_dir = view_dir / view_len
+    
+    # Wybierz osie projekcji
+    if abs(view_dir[2]) > 0.7:  # Z góry/dołu
+        proj_vertices = vertices[:, :2]
+    elif abs(view_dir[1]) > 0.7:  # Z przodu/tyłu
+        proj_vertices = vertices[:, [0, 2]]
+    else:  # Z boku
+        proj_vertices = vertices[:, [1, 2]]
+    
+    # Usuń NaN/Inf
+    valid_mask = np.isfinite(proj_vertices).all(axis=1)
+    proj_vertices_clean = proj_vertices[valid_mask]
+    
+    if len(proj_vertices_clean) == 0:
+        print("Brak prawidłowych wierzchołków dla SVG")
+        return None
+    
+    # Skalowanie - dopasuj do rozmiaru kartki z marginesem
+    min_vals = np.min(proj_vertices_clean, axis=0)
+    max_vals = np.max(proj_vertices_clean, axis=0)
+    ranges = max_vals - min_vals
+    ranges = np.where(ranges < 1e-3, 1.0, ranges)
+    
+    margin_mm = Config.PAPER_MARGIN
+    scale = min((svg_width - 2*margin_mm) / ranges[0], 
+                (svg_height - 2*margin_mm) / ranges[1])
+    
+    center = (min_vals + max_vals) / 2
+    scaled_vertices = (proj_vertices - center) * scale
+    scaled_vertices[:, 0] += svg_width / 2
+    scaled_vertices[:, 1] += svg_height / 2
+    
+    # Rogi kartki w przestrzeni 3D (dla opcjonalnej ramki)
+    paper_corners_3d = np.array([
+        [Config.PAPER_MARGIN, Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+        [paper_width - Config.PAPER_MARGIN, Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+        [paper_width - Config.PAPER_MARGIN, paper_height - Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+        [Config.PAPER_MARGIN, paper_height - Config.PAPER_MARGIN, Config.ROBOT_SAFE_Z],
+    ])
+    
+    # Projektuj ramkę
+    if abs(view_dir[2]) > 0.7:
+        paper_corners_2d = paper_corners_3d[:, :2]
+    elif abs(view_dir[1]) > 0.7:
+        paper_corners_2d = paper_corners_3d[:, [0, 2]]
+    else:
+        paper_corners_2d = paper_corners_3d[:, [1, 2]]
+    
+    paper_scaled = (paper_corners_2d - center) * scale
+    paper_scaled[:, 0] += svg_width / 2
+    paper_scaled[:, 1] += svg_height / 2
+    
+    # Rozpocznij generowanie SVG
+    svg_lines = []
+    svg_lines.append(f'<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
+    svg_lines.append(f'<svg width="{svg_width}mm" height="{svg_height}mm" ')
+    svg_lines.append(f'     viewBox="0 0 {svg_width} {svg_height}" ')
+    svg_lines.append(f'     xmlns="http://www.w3.org/2000/svg" version="1.1">')
+    svg_lines.append(f'  <title>Mesh Wireframe - {Config.PAPER_FORMAT}</title>')
+    svg_lines.append(f'  <desc>Generated from point cloud mesh</desc>')
+    svg_lines.append(f'  ')
+    
+    # Grupa dla trójkątów wireframe
+    svg_lines.append(f'  <g id="triangles" stroke="black" stroke-width="0.5" fill="none" stroke-linecap="round" stroke-linejoin="round">')
+    
+    triangle_count = 0
+    for tri in triangles:
+        if all(valid_mask[idx] for idx in tri):
+            pts = scaled_vertices[tri]
+            if all(0 <= p[0] <= svg_width and 0 <= p[1] <= svg_height for p in pts):
+                # Rysuj trójkąt jako polygon
+                points_str = " ".join([f"{p[0]:.3f},{p[1]:.3f}" for p in pts])
+                svg_lines.append(f'    <polygon points="{points_str}" />')
+                triangle_count += 1
+    
+    svg_lines.append(f'  </g>')
+    
+    # Grupa dla linii robota (jeśli są)
+    if lines_3d:
+        svg_lines.append(f'  ')
+        svg_lines.append(f'  <g id="robot_lines" stroke="black" stroke-width="1.0" fill="none" stroke-linecap="round">')
+        
+        line_count = 0
+        for start_3d, end_3d in lines_3d[:5000]:
+            # Projekcja linii
+            if abs(view_dir[2]) > 0.7:
+                start_2d = start_3d[:2]
+                end_2d = end_3d[:2]
+            elif abs(view_dir[1]) > 0.7:
+                start_2d = start_3d[[0, 2]]
+                end_2d = end_3d[[0, 2]]
+            else:
+                start_2d = start_3d[[1, 2]]
+                end_2d = end_3d[[1, 2]]
+            
+            # Skalowanie
+            start_scaled = (start_2d - center) * scale + [svg_width/2, svg_height/2]
+            end_scaled = (end_2d - center) * scale + [svg_width/2, svg_height/2]
+            
+            if (0 <= start_scaled[0] <= svg_width and 0 <= start_scaled[1] <= svg_height and
+                0 <= end_scaled[0] <= svg_width and 0 <= end_scaled[1] <= svg_height):
+                svg_lines.append(f'    <line x1="{start_scaled[0]:.3f}" y1="{start_scaled[1]:.3f}" '
+                               f'x2="{end_scaled[0]:.3f}" y2="{end_scaled[1]:.3f}" />')
+                line_count += 1
+        
+        svg_lines.append(f'  </g>')
+        print(f"Narysowano {line_count} linii robota w SVG")
+    
+    svg_lines.append(f'</svg>')
+    
+    # Zapisz do pliku
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(svg_lines))
+    
+    print(f"SVG zapisany: {output_path}")
+    print(f"  • Rozmiar: {svg_width}mm x {svg_height}mm ({Config.PAPER_FORMAT})")
+    print(f"  • Trójkąty: {triangle_count}")
+    return output_path
+
+# ---------------------
 # Eksport dla robota Hanwha HCR-3A (NAPRAWIONY - bez podwójnego mnożenia)
 # ---------------------
 @measure_time
@@ -1301,11 +1447,16 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
             except ImportError:
                 optimized_lines = optimize_path(lines_3d, max_lines=2000)
             
-            # Renderuj
+            # Renderuj PNG
             filename = f"render_{name}_cam_{cam_pos[0]:.1f}_{cam_pos[1]:.1f}_{cam_pos[2]:.1f}_target_{look_at[0]:.1f}_{look_at[1]:.1f}_{look_at[2]:.1f}.png"
             output_path = os.path.join(Config.OUTPUT_DIR, filename)
             
             render_mesh(mesh, cam_pos, look_at, output_path, optimized_lines)
+            
+            # Generuj SVG (bez statystyk, identyczny jak PNG)
+            svg_filename = filename.replace('.png', '.svg')
+            svg_output_path = os.path.join(Config.OUTPUT_DIR, svg_filename)
+            generate_svg_from_mesh(mesh, cam_pos, look_at, svg_output_path, optimized_lines)
             
             # Eksportuj dane tylko dla pierwszej pozycji
             if name == "front_high":
@@ -1361,12 +1512,17 @@ def main(point_cloud_path, camera_position=None, look_at_point=None, dev_mode=Fa
                 print(f"Używam standardowej optymalizacji dla {num_lines} linii")
                 optimized_lines = optimize_path(lines_3d, max_lines=2000)
         
-        # Renderuj
+        # Renderuj PNG
         filename = f"render_output_cam_{camera_position[0]:.1f}_{camera_position[1]:.1f}_{camera_position[2]:.1f}_target_{look_at_point[0]:.1f}_{look_at_point[1]:.1f}_{look_at_point[2]:.1f}.png"
         
         os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
         render_mesh(mesh, camera_position, look_at_point, 
                     os.path.join(Config.OUTPUT_DIR, filename), optimized_lines)
+        
+        # Generuj SVG (bez statystyk, identyczny jak PNG)
+        svg_filename = filename.replace('.png', '.svg')
+        svg_output_path = os.path.join(Config.OUTPUT_DIR, svg_filename)
+        generate_svg_from_mesh(mesh, camera_position, look_at_point, svg_output_path, optimized_lines)
         
         # Eksportuj dane robota
         export_robot_data(optimized_lines, Config.OUTPUT_DIR)
