@@ -10,6 +10,7 @@ import json
 import argparse
 from collections import Counter, defaultdict
 import svgwrite
+import xml.etree.ElementTree as ET
 
 # Opcjonalne: Numba dla przyspieszenia
 try:
@@ -265,8 +266,164 @@ def render_png(lines, output_path, view_dir):
     cv2.imwrite(output_path, img)
     print(f"PNG: {output_path}")
 
-@measure_time
-def render_svg(lines, output_path, view_dir, draw_mesh_lines=False):
+# ---------------------
+# Logo paths
+# ---------------------
+LOGO_PATHS = {
+    "min": os.path.join(os.path.dirname(__file__), "logos", "min.svg"),
+    "full": os.path.join(os.path.dirname(__file__), "logos", "full.svg"),
+}
+
+def get_svg_dimensions(svg_path):
+    """Pobiera wymiary SVG"""
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        
+        # Próbuj viewBox
+        viewbox = root.get('viewBox')
+        if viewbox:
+            parts = viewbox.split()
+            if len(parts) == 4:
+                return float(parts[2]), float(parts[3])
+        
+        # Próbuj width/height
+        w = root.get('width', '100')
+        h = root.get('height', '100')
+        w = float(''.join(c for c in w if c.isdigit() or c == '.') or '100')
+        h = float(''.join(c for c in h if c.isdigit() or c == '.') or '100')
+        return w, h
+    except:
+        return 100, 100
+
+def copy_element(elem):
+    """Rekurencyjnie kopiuje element XML usuwając namespace"""
+    # Usuń namespace z tagu
+    tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+    
+    # Skopiuj atrybuty (usuń namespace z kluczy)
+    attrib = {}
+    for k, v in elem.attrib.items():
+        key = k.split('}')[-1] if '}' in k else k
+        attrib[key] = v
+    
+    new_elem = ET.Element(tag, attrib)
+    new_elem.text = elem.text
+    new_elem.tail = elem.tail
+    
+    # Rekurencyjnie kopiuj dzieci
+    for child in elem:
+        new_elem.append(copy_element(child))
+    
+    return new_elem
+
+def embed_logo_in_svg(svg_path, logo_type, drawing_bounds):
+    """Osadza logo w SVG - w rogu kartki"""
+    logo_path = LOGO_PATHS.get(logo_type)
+    if not logo_path or not os.path.exists(logo_path):
+        print(f"Logo nie znalezione: {logo_path}")
+        return
+    
+    # Zarejestruj namespace SVG
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
+    
+    # Parsuj główny SVG
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+    
+    # Pobierz wymiary papieru
+    paper_w, paper_h = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+    if Config.PAPER_LANDSCAPE:
+        paper_w, paper_h = paper_h, paper_w
+    
+    # Pobierz wymiary logo
+    logo_w, logo_h = get_svg_dimensions(logo_path)
+    
+    margin = Config.PAPER_MARGIN
+    min_y, max_y = drawing_bounds
+    
+    # Stały rozmiar logo (dopasowany do rogu)
+    max_logo_w = 100  # mm
+    max_logo_h = 50  # mm
+    
+    if logo_type == "min":
+        max_logo_w *= .75 
+        max_logo_h *= .75
+    
+    logo_scale = min(max_logo_w / logo_w, max_logo_h / logo_h)
+    scaled_logo_w = logo_w * logo_scale
+    scaled_logo_h = logo_h * logo_scale
+    
+    # Sprawdź który róg jest wolny
+    # Preferuj prawy dolny róg
+    corners = [
+        ("bottom_right", paper_w - margin - scaled_logo_w, paper_h - margin - scaled_logo_h),
+        ("bottom_left", margin, paper_h - margin - scaled_logo_h),
+        ("top_right", paper_w - margin - scaled_logo_w, margin),
+        ("top_left", margin, margin),
+    ]
+    
+    # Wybierz pierwszy wolny róg (nie kolidujący z rysunkiem)
+    logo_x, logo_y = corners[0][1], corners[0][2]  # domyślnie prawy dolny
+    
+    for corner_name, cx, cy in corners:
+        # Sprawdź czy róg nie koliduje z rysunkiem
+        if cy + scaled_logo_h < min_y - 3 or cy > max_y + 3:
+            logo_x, logo_y = cx, cy
+            break
+    
+    # Parsuj logo SVG
+    logo_tree = ET.parse(logo_path)
+    logo_root = logo_tree.getroot()
+    
+    # Oblicz stroke-width
+    stroke_width = max(0.3, min(1.0 / logo_scale * 0.4, 1.5))
+    
+    # Stwórz grupę z transformacją
+    g = ET.SubElement(root, 'g')
+    g.set('transform', f'translate({logo_x:.2f},{logo_y:.2f}) scale({logo_scale:.6f})')
+    g.set('id', 'logo')
+    g.set('fill', 'none')
+    g.set('stroke', 'black')
+    g.set('stroke-width', f'{stroke_width:.2f}')
+    
+    # Kopiuj wszystkie dzieci logo do grupy
+    for child in logo_root:
+        copied = copy_element_outline(child)
+        g.append(copied)
+    
+    # Zapisz
+    with open(svg_path, 'wb') as f:
+        tree.write(f, encoding='utf-8', xml_declaration=True)
+    
+    print(f"Logo '{logo_type}' w rogu ({scaled_logo_w:.1f}x{scaled_logo_h:.1f}mm)")
+
+def copy_element_outline(elem):
+    """Rekurencyjnie kopiuje element XML usuwając namespace i wymuszając outline"""
+    tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+    
+    # Skopiuj atrybuty (usuń namespace z kluczy)
+    attrib = {}
+    for k, v in elem.attrib.items():
+        key = k.split('}')[-1] if '}' in k else k
+        # Usuń atrybuty fill (wymuszamy outline)
+        if key.lower() == 'fill':
+            continue
+        # Zachowaj stroke jeśli jest
+        attrib[key] = v
+    
+    new_elem = ET.Element(tag, attrib)
+    new_elem.text = elem.text
+    new_elem.tail = elem.tail
+    
+    # Rekurencyjnie kopiuj dzieci
+    for child in elem:
+        new_elem.append(copy_element_outline(child))
+    
+    return new_elem
+
+def render_svg(lines, output_path, view_dir, logo_type=None):
     """Renderuje linie do SVG używając svgwrite"""
     paper_w, paper_h = Config.PAPER_SIZES[Config.PAPER_FORMAT]
     if Config.PAPER_LANDSCAPE:
@@ -275,29 +432,39 @@ def render_svg(lines, output_path, view_dir, draw_mesh_lines=False):
     dwg = svgwrite.Drawing(output_path, size=(f"{paper_w}mm", f"{paper_h}mm"),
                            viewBox=f"0 0 {paper_w} {paper_h}")
     
-    if not lines:
-        dwg.save()
-        return
+    drawing_bounds = (paper_h / 2, paper_h / 2)  # domyślne
     
-    axes = get_projection_axes(view_dir)
-    pts_2d = np.array([[l[0][axes], l[1][axes]] for l in lines]).reshape(-1, 2)
+    if lines:
+        axes = get_projection_axes(view_dir)
+        pts_2d = np.array([[l[0][axes], l[1][axes]] for l in lines]).reshape(-1, 2)
+        
+        min_v, max_v = pts_2d.min(axis=0), pts_2d.max(axis=0)
+        ranges = np.maximum(max_v - min_v, 1e-3)
+        margin = Config.PAPER_MARGIN
+        scale = min((paper_w - 2*margin) / ranges[0], (paper_h - 2*margin) / ranges[1])
+        center = (min_v + max_v) / 2
+        offset = np.array([paper_w, paper_h]) / 2
+        
+        g = dwg.g(stroke="black", stroke_width="0.5", fill="none")
+        
+        y_coords = []
+        for s, e in lines:
+            p1 = (s[axes] - center) * scale + offset
+            p2 = (e[axes] - center) * scale + offset
+            g.add(dwg.line(start=(p1[0], p1[1]), end=(p2[0], p2[1])))
+            y_coords.extend([p1[1], p2[1]])
+        
+        dwg.add(g)
+        
+        if y_coords:
+            drawing_bounds = (min(y_coords), max(y_coords))
     
-    min_v, max_v = pts_2d.min(axis=0), pts_2d.max(axis=0)
-    ranges = np.maximum(max_v - min_v, 1e-3)
-    margin = Config.PAPER_MARGIN
-    scale = min((paper_w - 2*margin) / ranges[0], (paper_h - 2*margin) / ranges[1])
-    center = (min_v + max_v) / 2
-    offset = np.array([paper_w, paper_h]) / 2
-    
-    g = dwg.g(stroke="black", stroke_width="0.5", fill="none")
-    for s, e in lines:
-        p1 = (s[axes] - center) * scale + offset
-        p2 = (e[axes] - center) * scale + offset
-        g.add(dwg.line(start=(p1[0], p1[1]), end=(p2[0], p2[1])))
-    
-    dwg.add(g)
     dwg.save()
     print(f"SVG: {output_path}")
+    
+    # Dodaj logo jeśli podano
+    if logo_type:
+        embed_logo_in_svg(output_path, logo_type, drawing_bounds)
 
 # ---------------------
 # Eksport i skalowanie
@@ -340,7 +507,7 @@ def load_and_scale_mesh(path):
 # ---------------------
 # Main
 # ---------------------
-def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=False):
+def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=False, logo_type=None):
     print("=" * 50)
     print("MESH -> ROBOT PATH CONVERTER")
     print("=" * 50)
@@ -353,7 +520,6 @@ def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=Fal
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
     
     if dev_mode:
-        # Twórz podfoldery dla dev mode
         png_dir = os.path.join(Config.OUTPUT_DIR, "png")
         svg_dir = os.path.join(Config.OUTPUT_DIR, "svg")
         os.makedirs(png_dir, exist_ok=True)
@@ -377,7 +543,7 @@ def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=Fal
                 lines = optimize_path(lines)
                 
                 render_png(lines, os.path.join(png_dir, f"{name}_{mode}.png"), view_dir)
-                render_svg(lines, os.path.join(svg_dir, f"{name}_{mode}.svg"), view_dir)
+                render_svg(lines, os.path.join(svg_dir, f"{name}_{mode}.svg"), view_dir, logo_type)
     else:
         if camera_pos is None:
             dist = max(extent[0], extent[1]) * 2.5
@@ -393,7 +559,7 @@ def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=Fal
             lines = optimize_path(lines)
             
             render_png(lines, os.path.join(Config.OUTPUT_DIR, f"{mode}.png"), view_dir)
-            render_svg(lines, os.path.join(Config.OUTPUT_DIR, f"{mode}.svg"), view_dir)
+            render_svg(lines, os.path.join(Config.OUTPUT_DIR, f"{mode}.svg"), view_dir, logo_type)
     
     if save_mesh:
         o3d.io.write_triangle_mesh(os.path.join(Config.OUTPUT_DIR, "mesh.ply"), mesh)
@@ -408,6 +574,7 @@ if __name__ == "__main__":
     parser.add_argument('--target', nargs=3, type=float, metavar=('X', 'Y', 'Z'))
     parser.add_argument('--dev', action='store_true', help='Tryb deweloperski')
     parser.add_argument('--save-mesh', action='store_true', help='Zapisz przetworzony mesh do PLY')
+    parser.add_argument('--logo', choices=['min', 'full'], help='Dodaj logo (min lub full)')
     args = parser.parse_args()
     
     cam = np.array(args.camera) if args.camera else None
@@ -416,4 +583,4 @@ if __name__ == "__main__":
     if (cam is None) != (target is None):
         sys.exit("Błąd: Podaj --camera i --target razem")
     
-    main(args.mesh_file, cam, target, args.dev, args.save_mesh)
+    main(args.mesh_file, cam, target, args.dev, args.save_mesh, args.logo)
