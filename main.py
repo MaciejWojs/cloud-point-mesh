@@ -11,6 +11,7 @@ import argparse
 from collections import Counter, defaultdict
 import svgwrite
 import xml.etree.ElementTree as ET
+import math
 
 # Opcjonalne: Numba dla przyspieszenia
 try:
@@ -33,12 +34,18 @@ class Config:
     DRAWING_SPEED = 100
     TRAVEL_SPEED = 150
     MAX_TRIANGLES = 200
+    MAX_TRIANGLES_OUTLINE = 5000  # Więcej trójkątów dla outline dla lepszej ciągłości
     PAPER_FORMAT = "A4"
     ROBOT_WORKSPACE_Z = 100.0
     ROBOT_SAFE_Z = 50.0
     PAPER_SIZES = {"A4": (210.0, 297.0), "A5": (148.0, 210.0), "A3": (297.0, 420.0)}
     PAPER_MARGIN = 10.0
     PAPER_LANDSCAPE = False
+    
+    # Nowe parametry progowe
+    MIN_SEGMENT_LENGTH = 0.8   # mm - minimalna długość segmentu, krótsze usuwamy
+    MIN_CHAIN_LENGTH = 4.0     # mm - minimalna długość całego łańcucha (sumarycznie)
+    MIN_SEGMENTS_IN_CHAIN = 2  # minimalna liczba segmentów w łańcuchu
 
 def measure_time(func):
     @wraps(func)
@@ -102,66 +109,217 @@ def get_projection_axes(view_dir):
         return [0, 2]
     return [1, 2]
 
+
+def _lines_to_graph(lines, quant=4):
+    """Konwertuje listę linii (s,e) -> macierz wierzchołków i lista krawędzi (indeksy)"""
+    coord_to_idx = {}
+    vertices = []
+    edges = []
+    for s, e in lines:
+        ks = tuple(np.round(s, quant).tolist())
+        ke = tuple(np.round(e, quant).tolist())
+        if ks not in coord_to_idx:
+            coord_to_idx[ks] = len(vertices); vertices.append(np.array(ks, dtype=np.float64))
+        if ke not in coord_to_idx:
+            coord_to_idx[ke] = len(vertices); vertices.append(np.array(ke, dtype=np.float64))
+        edges.append((coord_to_idx[ks], coord_to_idx[ke]))
+    return np.array(vertices, dtype=np.float64), edges
+
+def _edge_length(vertices, edge):
+    a, b = edge
+    return float(np.linalg.norm(vertices[a] - vertices[b]))
+
+def _prune_short_dangles(vertices, edges, min_len, max_iter=10):
+    """
+    Iteracyjnie usuwa krawędzie wiszące (degree==1) krótsze niż min_len.
+    Zwraca listę pozostałych krawędzi jako tuple(index,index).
+    """
+    adj = defaultdict(list)
+    for a,b in edges:
+        adj[a].append(b); adj[b].append(a)
+    edge_set = set(tuple(sorted(e)) for e in edges)
+    for _ in range(max_iter):
+        to_remove = []
+        degrees = {v: len(nei) for v, nei in adj.items()}
+        for e in list(edge_set):
+            a,b = e
+            if degrees.get(a,0) == 1 or degrees.get(b,0) == 1:
+                if _edge_length(vertices, e) < min_len:
+                    to_remove.append(e)
+        if not to_remove:
+            break
+        for e in to_remove:
+            a,b = e
+            edge_set.discard(e)
+            if b in adj[a]: adj[a].remove(b)
+            if a in adj[b]: adj[b].remove(a)
+    return [tuple(e) for e in edge_set]
+
+def _filter_short_chains(vertices, edges, min_chain_len, min_segments):
+    """
+    Buduje łańcuchy (chain_segments) i odrzuca te krótsze niż min_chain_len
+    lub z mniejszą liczbą segmentów niż min_segments. Zwraca listę linii.
+    """
+    if not edges:
+        return []
+    chains = chain_segments(edges, vertices)
+    out_lines = []
+    for chain in chains:
+        segs = len(chain) - 1
+        if segs < min_segments:
+            continue
+        total = 0.0
+        for i in range(segs):
+            total += np.linalg.norm(chain[i+1] - chain[i])
+        if total >= min_chain_len:
+            for i in range(segs):
+                out_lines.append((chain[i].copy(), chain[i+1].copy()))
+    return out_lines
+
+def remove_artifacts(lines, min_seg_len=None, min_chain_len=None, min_segments=None):
+    """
+    Usuwa krótkie pojedyncze segmenty oraz krótkie łańcuchy.
+    Zwraca przefiltrowaną listę linii.
+    """
+    if not lines:
+        return []
+    if min_seg_len is None:
+        min_seg_len = Config.MIN_SEGMENT_LENGTH
+    if min_chain_len is None:
+        min_chain_len = Config.MIN_CHAIN_LENGTH
+    if min_segments is None:
+        min_segments = Config.MIN_SEGMENTS_IN_CHAIN
+
+    vertices, edges = _lines_to_graph(lines, quant=4)
+    # Usuń wiszące krótkie odcinki
+    pruned = _prune_short_dangles(vertices, edges, min_seg_len)
+    # Filtruj krótkie łańcuchy
+    clean = _filter_short_chains(vertices, pruned, min_chain_len, min_segments)
+    if clean:
+        return clean
+    # Fallback: usuń tylko krótkie pojedyncze segmenty
+    return [ln for ln in lines if np.linalg.norm(ln[1] - ln[0]) >= min_seg_len]
+
 def chain_segments(edges, vertices):
-    """Łączy krawędzie w ciągłe łańcuchy"""
+    """Łączy krawędzie w ciągłe łańcuchy - ulepszona wersja dla lepszej ciągłości"""
+    if not edges:
+        return []
+    
+    # Buduj graf sąsiedztwa
     adj = defaultdict(list)
     for v1, v2 in edges:
         adj[v1].append(v2)
         adj[v2].append(v1)
     
     chains = []
-    while adj:
-        start = next((n for n in adj if len(adj[n]) == 1), next(iter(adj)))
-        chain = [vertices[start].copy()]
-        curr = start
+    visited_edges = set()
+    
+    # Znajdź wierzchołki o nieparzystym stopniu (końce łańcuchów)
+    odd_vertices = [v for v, neighbors in adj.items() if len(neighbors) % 2 == 1]
+    
+    # Jeśli nie ma wierzchołków o nieparzystym stopniu, wybierz dowolny
+    start_vertices = odd_vertices if odd_vertices else list(adj.keys())
+    
+    for start in start_vertices[:]:
+        if start not in adj or not adj[start]:
+            continue
+            
+        # Użyj DFS dla lepszej ciągłości
+        stack = [start]
+        chain = []
         
-        while curr in adj and adj[curr]:
-            next_node = adj[curr].pop(0)
-            if not adj[curr]:
-                del adj[curr]
-            if next_node in adj and curr in adj[next_node]:
-                adj[next_node].remove(curr)
-                if not adj[next_node]:
-                    del adj[next_node]
-            chain.append(vertices[next_node].copy())
-            if next_node == start:
-                break
-            curr = next_node
+        while stack:
+            curr = stack[-1]
+            if adj[curr]:
+                next_node = adj[curr].pop()
+                if next_node in adj and curr in adj[next_node]:
+                    adj[next_node].remove(curr)
+                
+                edge_key = tuple(sorted([curr, next_node]))
+                if edge_key not in visited_edges:
+                    visited_edges.add(edge_key)
+                    stack.append(next_node)
+            else:
+                chain.append(stack.pop())
         
         if len(chain) > 1:
-            chains.append(chain)
+            # Konwertuj indeksy wierzchołków na współrzędne
+            coord_chain = [vertices[i] for i in chain]
+            chains.append(coord_chain)
+    
+    # Dodaj pozostałe cykle
+    remaining_vertices = [v for v in adj if adj[v]]
+    while remaining_vertices:
+        start = remaining_vertices[0]
+        stack = [start]
+        chain = []
+        
+        while stack:
+            curr = stack[-1]
+            if adj[curr]:
+                next_node = adj[curr].pop()
+                if next_node in adj and curr in adj[next_node]:
+                    adj[next_node].remove(curr)
+                
+                edge_key = tuple(sorted([curr, next_node]))
+                if edge_key not in visited_edges:
+                    visited_edges.add(edge_key)
+                    stack.append(next_node)
+            else:
+                chain.append(stack.pop())
+        
+        if len(chain) > 1:
+            coord_chain = [vertices[i] for i in chain]
+            chains.append(coord_chain)
+        
+        remaining_vertices = [v for v in adj if adj[v]]
+    
     return chains
 
 def optimize_chain_order(chains):
-    """Optymalizuje kolejność łańcuchów"""
+    """Optymalizuje kolejność łańcuchów dla minimalnego czasu podróży"""
     if not chains:
         return []
-    ordered, remaining = [], chains[:]
-    current_pos = np.zeros(3)
+    
+    ordered = []
+    remaining = chains[:]
+    current_pos = np.array([0, 0, 0])  # Start od środka
     
     while remaining:
-        best_idx, best_dist, best_rev = 0, float('inf'), False
-        for i, c in enumerate(remaining):
-            d_start = np.sum((current_pos - c[0])**2)
-            d_end = np.sum((current_pos - c[-1])**2)
-            if d_start < best_dist:
-                best_idx, best_dist, best_rev = i, d_start, False
-            if d_end < best_dist:
-                best_idx, best_dist, best_rev = i, d_end, True
+        best_idx = 0
+        best_dist = float('inf')
+        best_reverse = False
         
-        chain = remaining.pop(best_idx)
-        if best_rev:
-            chain = chain[::-1]
-        ordered.append(chain)
-        current_pos = chain[-1]
+        for i, chain in enumerate(remaining):
+            # Sprawdź odległość do początku łańcucha
+            dist_start = np.linalg.norm(current_pos - chain[0])
+            # Sprawdź odległość do końca łańcucha  
+            dist_end = np.linalg.norm(current_pos - chain[-1])
+            
+            if dist_start < best_dist:
+                best_dist = dist_start
+                best_idx = i
+                best_reverse = False
+            if dist_end < best_dist:
+                best_dist = dist_end
+                best_idx = i
+                best_reverse = True
+        
+        selected_chain = remaining.pop(best_idx)
+        if best_reverse:
+            selected_chain = selected_chain[::-1]
+        
+        ordered.append(selected_chain)
+        current_pos = selected_chain[-1]
+    
     return ordered
 
 # ---------------------
-# Generowanie linii
+# Generowanie linii - ULEPSZONE
 # ---------------------
 @measure_time
-def generate_lines(mesh, camera_pos, threshold=0.1, wireframe=False):
-    """Generuje linie z meshu"""
+def generate_lines_from_mesh(mesh, camera_pos, threshold=0.1, wireframe=False):
+    """Generuje linie z mesha z maksymalną ciągłością"""
     if len(mesh.triangles) == 0:
         return []
 
@@ -183,54 +341,134 @@ def generate_lines(mesh, camera_pos, threshold=0.1, wireframe=False):
     edge_counter = Counter()
     for tri in visible_tris:
         for i in range(3):
-            edge_counter[tuple(sorted([tri[i], tri[(i+1)%3]]))] += 1
+            edge = tuple(sorted([tri[i], tri[(i+1)%3]]))
+            edge_counter[edge] += 1
     
     if wireframe:
+        # Dla wireframe używamy wszystkich krawędzi
         edges = list(edge_counter.keys())
+        return [(vertices[e[0]], vertices[e[1]]) for e in edges]
     else:
-        edges = [e for e, c in edge_counter.items() if c == 1]
-        chains = chain_segments(edges, vertices)
-        chains = optimize_chain_order(chains)
-        return [(c[i], c[i+1]) for c in chains for i in range(len(c)-1)]
-    
-    return [(vertices[e[0]], vertices[e[1]]) for e in edges]
+        # Dla outline używamy tylko krawędzi granicznych (występujących raz)
+        boundary_edges = [e for e, c in edge_counter.items() if c == 1]
+        
+        if not boundary_edges:
+            return []
+        
+        # Użyj zaawansowanego łączenia w łańcuchy dla maksymalnej ciągłości
+        chains = chain_segments(boundary_edges, vertices)
+        
+        if not chains:
+            # Fallback: zwróć pojedyncze krawędzie jeśli łączenie nie zadziała
+            return [(vertices[e[0]], vertices[e[1]]) for e in boundary_edges]
+        
+        # Optymalizuj kolejność łańcuchów
+        optimized_chains = optimize_chain_order(chains)
+        
+        # Konwertuj łańcuchy z powrotem na linie
+        lines = []
+        for chain in optimized_chains:
+            for i in range(len(chain) - 1):
+                lines.append((chain[i], chain[i+1]))
+        
+        # USUŃ ARTEFAKTY (krótkie segmenty/łańcuchy)
+        lines = remove_artifacts(lines)
+        
+        return lines
 
 @measure_time
-def optimize_path(lines, max_lines=2000):
-    """Optymalizuje kolejność linii"""
+def generate_lines(original_mesh, simplified_mesh, camera_pos, threshold=0.1, wireframe=False):
+    """Generuje linie z obu meshy - oryginalnego i uproszczonego"""
+    if wireframe:
+        # Dla wireframe używamy tylko uproszczonego mesha
+        return generate_lines_from_mesh(simplified_mesh, camera_pos, threshold, True)
+    else:
+        # Dla outline używamy OBIEGU meshy dla maksymalnej ciągłości
+        original_lines = generate_lines_from_mesh(original_mesh, camera_pos, threshold, False)
+        simplified_lines = generate_lines_from_mesh(simplified_mesh, camera_pos, threshold, False)
+        
+        # Połącz linie z obu meshy, preferując oryginalny dla lepszej jakości
+        combined_lines = []
+        
+        # Najpierw dodaj linie z oryginalnego mesha (bardziej szczegółowe)
+        combined_lines.extend(original_lines)
+        
+        # Dodaj unikalne linie z uproszczonego mesha, które uzupełniają luki
+        original_set = set()
+        for line in original_lines:
+            # Tworzymy klucz niezależny od kolejności punktów
+            key = tuple(sorted([tuple(line[0].round(4)), tuple(line[1].round(4))]))
+            original_set.add(key)
+        
+        for line in simplified_lines:
+            key = tuple(sorted([tuple(line[0].round(4)), tuple(line[1].round(4))]))
+            if key not in original_set:
+                combined_lines.append(line)
+        
+        # Usuń artefakty z połączonego zestawu
+        combined_lines = remove_artifacts(combined_lines)
+        
+        return combined_lines
+
+@measure_time
+def optimize_path(lines, max_lines=5000):
+    """Optymalizuje kolejność linii dla minimalnego czasu podróży"""
     if not lines or len(lines) <= 1:
         return lines
     
+    # Ogranicz liczbę linii jeśli jest zbyt duża
     if len(lines) > max_lines:
-        lines = [lines[i] for i in np.linspace(0, len(lines)-1, max_lines, dtype=int)]
+        indices = np.linspace(0, len(lines)-1, max_lines, dtype=int)
+        lines = [lines[i] for i in indices]
     
+    # Konwertuj na numpy arrays dla wydajności
     starts = np.array([l[0] for l in lines], dtype=np.float32)
     ends = np.array([l[1] for l in lines], dtype=np.float32)
     
-    optimized, used = [lines[0]], np.zeros(len(lines), dtype=bool)
-    used[0] = True
-    current_end = ends[0]
+    optimized = []
+    used = np.zeros(len(lines), dtype=bool)
     
+    # Zacznij od linii najbliżej środka
+    center = np.mean(np.vstack([starts, ends]), axis=0)
+    distances = np.linalg.norm(starts - center, axis=1)
+    start_idx = np.argmin(distances)
+    
+    optimized.append(lines[start_idx])
+    used[start_idx] = True
+    current_end = ends[start_idx]
+    
+    # Optymalizuj kolejność pozostałych linii
     for _ in range(len(lines) - 1):
         if NUMBA_AVAILABLE:
             best_idx, flip = find_nearest_numba(current_end, starts, ends, used)
         else:
-            unused = np.where(~used)[0]
-            if len(unused) == 0:
+            unused_mask = ~used
+            if not np.any(unused_mask):
                 break
-            d_starts = np.linalg.norm(starts[unused] - current_end, axis=1)
-            d_ends = np.linalg.norm(ends[unused] - current_end, axis=1)
-            if np.min(d_starts) < np.min(d_ends):
-                best_idx, flip = unused[np.argmin(d_starts)], False
+                
+            unused_indices = np.where(unused_mask)[0]
+            dist_to_starts = np.linalg.norm(starts[unused_indices] - current_end, axis=1)
+            dist_to_ends = np.linalg.norm(ends[unused_indices] - current_end, axis=1)
+            
+            min_start_idx = np.argmin(dist_to_starts)
+            min_end_idx = np.argmin(dist_to_ends)
+            
+            if dist_to_starts[min_start_idx] < dist_to_ends[min_end_idx]:
+                best_idx = unused_indices[min_start_idx]
+                flip = False
             else:
-                best_idx, flip = unused[np.argmin(d_ends)], True
+                best_idx = unused_indices[min_end_idx]
+                flip = True
         
         if best_idx == -1:
             break
+            
         used[best_idx] = True
         line = lines[best_idx]
+        
         if flip:
             line = (line[1], line[0])
+            
         optimized.append(line)
         current_end = line[1]
     
@@ -467,14 +705,20 @@ def render_svg(lines, output_path, view_dir, logo_type=None):
         embed_logo_in_svg(output_path, logo_type, drawing_bounds)
 
 # ---------------------
-# Eksport i skalowanie
+# Eksport i skalowanie - ZMODYFIKOWANE
 # ---------------------
 @measure_time
-def load_and_scale_mesh(path):
-    """Wczytuje i skaluje mesh"""
+def load_and_scale_mesh(path, max_triangles=None):
+    """Wczytuje i skaluje mesh z opcjonalnym uproszceniem"""
     mesh = o3d.io.read_triangle_mesh(path)
-    if len(mesh.triangles) > Config.MAX_TRIANGLES:
-        mesh = mesh.simplify_quadric_decimation(Config.MAX_TRIANGLES)
+    
+    # Zapisz oryginalny mesh przed uproszceniem
+    original_mesh = mesh
+    
+    # Uprość jeśli podano max_triangles
+    if max_triangles and len(mesh.triangles) > max_triangles:
+        mesh = mesh.simplify_quadric_decimation(max_triangles)
+        print(f"Uproszczono mesh z {len(original_mesh.triangles)} do {len(mesh.triangles)} trójkątów")
     
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_triangles()
@@ -501,19 +745,28 @@ def load_and_scale_mesh(path):
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     mesh.compute_triangle_normals()
     
+    # Przetwórz również oryginalny mesh z tym samym skalowaniem i przesunięciem
+    if max_triangles and len(original_mesh.triangles) > max_triangles:
+        original_vertices = (np.asarray(original_mesh.vertices) - center) * scale
+        original_vertices[:, :2] += [paper_w/2, paper_h/2]
+        original_vertices[:, 2] += Config.ROBOT_SAFE_Z + extent[2]*scale/2
+        original_mesh.vertices = o3d.utility.Vector3dVector(original_vertices)
+        original_mesh.compute_triangle_normals()
+    
     print(f"Mesh: {len(mesh.vertices)} wierz., {len(mesh.triangles)} trój., skala: {scale:.4f}")
-    return mesh
+    return original_mesh, mesh
 
 # ---------------------
-# Main
+# Main - ZMODYFIKOWANE
 # ---------------------
 def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=False, logo_type=None):
     print("=" * 50)
     print("MESH -> ROBOT PATH CONVERTER")
     print("=" * 50)
     
-    mesh = load_and_scale_mesh(mesh_path)
-    bounds = mesh.get_axis_aligned_bounding_box()
+    # Wczytaj OBIE wersje mesha - oryginalną i uproszczoną
+    original_mesh, simplified_mesh = load_and_scale_mesh(mesh_path, Config.MAX_TRIANGLES)
+    bounds = simplified_mesh.get_axis_aligned_bounding_box()
     center = bounds.get_center()
     extent = bounds.get_extent()
     
@@ -537,35 +790,214 @@ def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=Fal
         for name, offset in positions:
             cam = center + offset
             view_dir = (center - cam) / np.linalg.norm(center - cam)
-            
-            for mode in ["outline", "wireframe"]:
-                lines = generate_lines(mesh, cam, Config.VISIBILITY_THRESHOLD, mode == "wireframe")
-                lines = optimize_path(lines)
-                
-                render_png(lines, os.path.join(png_dir, f"{name}_{mode}.png"), view_dir)
-                render_svg(lines, os.path.join(svg_dir, f"{name}_{mode}.svg"), view_dir, logo_type)
+            # Outline: zapisz osobno oryginalny, uproszczony i merged
+            orig_lines = generate_lines_from_mesh(original_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=False)
+            simpl_lines = generate_lines_from_mesh(simplified_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=False)
+            merged_lines = generate_lines(original_mesh, simplified_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=False)
+
+            # NOWE: orig_optimized bazujące na oryginalnym meshu (uproszczone łańcuchy)
+            orig_optimized_lines = generate_orig_optimized(original_mesh, cam, view_dir, Config.VISIBILITY_THRESHOLD, epsilon=0.5, min_noise=0.05, area=0.01)
+
+            if orig_lines:
+                orig_opt = optimize_path(orig_lines)
+                render_png(orig_opt, os.path.join(png_dir, f"{name}_outline_orig.png"), view_dir)
+                render_svg(orig_opt, os.path.join(svg_dir, f"{name}_outline_orig.svg"), view_dir, logo_type)
+            if simpl_lines:
+                simpl_opt = optimize_path(simpl_lines)
+                render_png(simpl_opt, os.path.join(png_dir, f"{name}_outline_simpl.png"), view_dir)
+                render_svg(simpl_opt, os.path.join(svg_dir, f"{name}_outline_simpl.svg"), view_dir, logo_type)
+            if merged_lines:
+                merged_opt = optimize_path(merged_lines)
+                render_png(merged_opt, os.path.join(png_dir, f"{name}_outline.png"), view_dir)
+                render_svg(merged_opt, os.path.join(svg_dir, f"{name}_outline.svg"), view_dir, logo_type)
+
+            # NOWE: zapisz orig_optimized
+            if orig_optimized_lines:
+                oo_opt = optimize_path(orig_optimized_lines)
+                render_png(oo_opt, os.path.join(png_dir, f"{name}_outline_orig_optimized.png"), view_dir)
+                render_svg(oo_opt, os.path.join(svg_dir, f"{name}_outline_orig_optimized.svg"), view_dir, logo_type)
+
+            # Wireframe (jak wcześniej) - tylko uproszczony mesh
+            wf_lines = generate_lines_from_mesh(simplified_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=True)
+            if wf_lines:
+                wf_opt = optimize_path(wf_lines)
+                render_png(wf_opt, os.path.join(png_dir, f"{name}_wireframe.png"), view_dir)
+                render_svg(wf_opt, os.path.join(svg_dir, f"{name}_wireframe.svg"), view_dir, logo_type)
     else:
         if camera_pos is None:
             dist = max(extent[0], extent[1]) * 2.5
             camera_pos = center + np.array([0, 0, dist])
             look_at = center
-            R = mesh.get_rotation_matrix_from_xyz((0, 0, np.pi))
-            mesh.rotate(R, center=center)
+            R = simplified_mesh.get_rotation_matrix_from_xyz((0, 0, np.pi))
+            simplified_mesh.rotate(R, center=center)
+            original_mesh.rotate(R, center=center)
         
         view_dir = (look_at - camera_pos) / np.linalg.norm(look_at - camera_pos)
         
-        for mode in ["outline", "wireframe"]:
-            lines = generate_lines(mesh, camera_pos, Config.VISIBILITY_THRESHOLD, mode == "wireframe")
-            lines = optimize_path(lines)
-            
-            render_png(lines, os.path.join(Config.OUTPUT_DIR, f"{mode}.png"), view_dir)
-            render_svg(lines, os.path.join(Config.OUTPUT_DIR, f"{mode}.svg"), view_dir, logo_type)
+        # Outline: oryginalny, uproszczony i merged
+        orig_lines = generate_lines_from_mesh(original_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=False)
+        simpl_lines = generate_lines_from_mesh(simplified_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=False)
+        merged_lines = generate_lines(original_mesh, simplified_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=False)
+
+        # NOWE: orig_optimized
+        orig_optimized_lines = generate_orig_optimized(original_mesh, camera_pos, view_dir, Config.VISIBILITY_THRESHOLD, epsilon=0.5, min_noise=0.05, area=0.01)
+
+        if orig_lines:
+            orig_opt = optimize_path(orig_lines)
+            render_png(orig_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig.png"), view_dir)
+            render_svg(orig_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig.svg"), view_dir, logo_type)
+        if simpl_lines:
+            simpl_opt = optimize_path(simpl_lines)
+            render_png(simpl_opt, os.path.join(Config.OUTPUT_DIR, "outline_simpl.png"), view_dir)
+            render_svg(simpl_opt, os.path.join(Config.OUTPUT_DIR, "outline_simpl.svg"), view_dir, logo_type)
+        if merged_lines:
+            merged_opt = optimize_path(merged_lines)
+            render_png(merged_opt, os.path.join(Config.OUTPUT_DIR, "outline.png"), view_dir)
+            render_svg(merged_opt, os.path.join(Config.OUTPUT_DIR, "outline.svg"), view_dir, logo_type)
+        
+        # NOWE: zapisz orig_optimized (poza resztą)
+        if orig_optimized_lines:
+            oo_opt = optimize_path(orig_optimized_lines)
+            render_png(oo_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig_optimized.png"), view_dir)
+            render_svg(oo_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig_optimized.svg"), view_dir, logo_type)
+
+        # Wireframe (jak wcześniej) - tylko uproszczony mesh
+        wf_lines = generate_lines_from_mesh(simplified_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=True)
+        if wf_lines:
+            wf_opt = optimize_path(wf_lines)
+            render_png(wf_opt, os.path.join(Config.OUTPUT_DIR, "wireframe.png"), view_dir)
+            render_svg(wf_opt, os.path.join(Config.OUTPUT_DIR, "wireframe.svg"), view_dir, logo_type)
     
     if save_mesh:
-        o3d.io.write_triangle_mesh(os.path.join(Config.OUTPUT_DIR, "mesh.ply"), mesh)
-        print(f"Mesh zapisany: {Config.OUTPUT_DIR}/mesh.ply")
+        o3d.io.write_triangle_mesh(os.path.join(Config.OUTPUT_DIR, "mesh_original.ply"), original_mesh)
+        o3d.io.write_triangle_mesh(os.path.join(Config.OUTPUT_DIR, "mesh_simplified.ply"), simplified_mesh)
+        print(f"Meshe zapisane: {Config.OUTPUT_DIR}/mesh_*.ply")
     
     print(f"\n✅ Gotowe! -> {Config.OUTPUT_DIR}/")
+
+def _rdp_indices(points, eps):
+    """Zwraca indeksy punktów po uproszczeniu RDP (2D)"""
+    if len(points) <= 2:
+        return list(range(len(points)))
+
+    def point_line_distance(pt, a, b):
+        # odległość punktu pt od odcinka ab (2D)
+        if np.allclose(a, b):
+            return np.linalg.norm(pt - a)
+        num = abs((b[0]-a[0])*(a[1]-pt[1]) - (a[0]-pt[0])*(b[1]-a[1]))
+        den = np.hypot(b[0]-a[0], b[1]-a[1])
+        return num / den
+
+    idxs = []
+
+    def rdp_rec(s, e):
+        if e <= s + 1:
+            return
+        a = points[s]; b = points[e]
+        max_d = -1.0; max_i = -1
+        for i in range(s+1, e):
+            d = point_line_distance(points[i], a, b)
+            if d > max_d:
+                max_d = d; max_i = i
+        if max_d > eps:
+            rdp_rec(s, max_i)
+            rdp_rec(max_i, e)
+        else:
+            # no intermediate points needed
+            idxs.append(s)
+            idxs.append(e)
+
+    rdp_rec(0, len(points)-1)
+    if not idxs:
+        return list(range(len(points)))
+    # uporządkuj i usuń duplikaty
+    idxs = sorted(set(idxs))
+    # upewnij się, że są zawarte końce
+    if idxs[0] != 0:
+        idxs.insert(0, 0)
+    if idxs[-1] != len(points)-1:
+        idxs.append(len(points)-1)
+    return idxs
+
+def generate_orig_optimized(original_mesh, camera_pos, view_dir, threshold=0.1, epsilon=0.5, min_noise=0.05, area=0.01):
+    """
+    Wyciąga outline z ORYGINALNEGO mesha i upraszcza łańcuchy (RDP + filtracja)
+    Zwraca listę linii [(p0,p1), ...] gdzie p* to 3D numpy array.
+    """
+    # Wczesne warunki
+    if len(original_mesh.triangles) == 0:
+        return []
+
+    vertices = np.asarray(original_mesh.vertices, dtype=np.float64)
+    triangles = np.asarray(original_mesh.triangles, dtype=np.int32)
+
+    if len(original_mesh.triangle_normals) == 0:
+        original_mesh.compute_triangle_normals()
+    normals = np.asarray(original_mesh.triangle_normals, dtype=np.float64)
+    centers = np.mean(vertices[triangles], axis=1)
+
+    visible_mask = backface_culling(centers, normals, camera_pos, threshold)
+    visible_tris = triangles[visible_mask]
+
+    if len(visible_tris) == 0:
+        return []
+
+    # policz krawędzie i wybierz te graniczne
+    edge_counter = Counter()
+    for tri in visible_tris:
+        for i in range(3):
+            edge = tuple(sorted([int(tri[i]), int(tri[(i+1)%3])]))
+            edge_counter[edge] += 1
+    boundary_edges = [e for e, c in edge_counter.items() if c == 1]
+    if not boundary_edges:
+        return []
+
+    # połącz krawędzie w łańcuchy (zwraca listę list punktów 3D)
+    chains = chain_segments(boundary_edges, vertices)
+    if not chains:
+        return []
+
+    axes = get_projection_axes(view_dir)
+    simplified_chains = []
+
+    for chain in chains:
+        pts3 = np.array(chain)  # (N,3)
+        pts2 = pts3[:, axes]    # projekcja 2D
+
+        # filtracja małych elementów po powierzchni w rzucie 2D
+        bbox = pts2.max(axis=0) - pts2.min(axis=0)
+        if bbox[0] * bbox[1] < area:
+            continue
+
+        # uproszczenie RDP (zwracamy indeksy w oryginalnym łańcuchu)
+        idxs = _rdp_indices(pts2, epsilon)
+        if len(idxs) < 2:
+            continue
+
+        # policz długość uproszczonego łańcucha i odrzuć za krótki (szum)
+        total_len = 0.0
+        for i in range(len(idxs)-1):
+            total_len += np.linalg.norm(pts3[idxs[i+1]] - pts3[idxs[i]])
+        if total_len < min_noise:
+            continue
+
+        simp = [pts3[i].copy() for i in idxs]
+        # minimalnie: jeśli RDP zwróci zbyt mało punktów, zachowaj oryginalne
+        if len(simp) >= 2:
+            simplified_chains.append(simp)
+
+    if not simplified_chains:
+        return []
+
+    # konwersja łańcuchów na listę linii
+    lines = []
+    for ch in simplified_chains:
+        for i in range(len(ch)-1):
+            lines.append((ch[i], ch[i+1]))
+
+    # usuń artefakty (krótkie segmenty/łańcuchy)
+    lines = remove_artifacts(lines)
+    return lines
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Mesh -> Robot Path')
