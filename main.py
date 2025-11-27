@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 import svgwrite
 import xml.etree.ElementTree as ET
 import math
+import concurrent.futures
 
 # Opcjonalne: Numba dla przyspieszenia
 try:
@@ -46,6 +47,9 @@ class Config:
     MIN_SEGMENT_LENGTH = 0.8   # mm - minimalna długość segmentu, krótsze usuwamy
     MIN_CHAIN_LENGTH = 4.0     # mm - minimalna długość całego łańcucha (sumarycznie)
     MIN_SEGMENTS_IN_CHAIN = 2  # minimalna liczba segmentów w łańcuchu
+
+# Threshold dla wielkich siatek (liczba trójkątów)
+LARGE_MESH_TRI = 1_000_000
 
 def measure_time(func):
     @wraps(func)
@@ -335,33 +339,50 @@ def generate_lines_from_mesh(mesh, camera_pos, threshold=0.1, wireframe=False):
 
     tri = tri[visible]
 
-    # GENEROWANIE KRAWĘDZI
-    e0 = tri[:, [0, 1]]
-    e1 = tri[:, [1, 2]]
-    e2 = tri[:, [2, 0]]
+    # GENEROWANIE KRAWĘDZI + klucze — zoptymalizowane dla bardzo dużych siatek
+    num_tri = len(tri)
+    if num_tri > LARGE_MESH_TRI and not NUMBA_AVAILABLE:
+        # wielowątkowe budowanie kluczy na kawałkach (ThreadPool, bo numpy wektoryzuje pracę)
+        n_workers = min(8, (os.cpu_count() or 4))
+        # dzielimy na równomierne chunki
+        chunk_size = (num_tri + n_workers - 1) // n_workers
+        chunks = [tri[i*chunk_size:(i+1)*chunk_size] for i in range(n_workers) if i*chunk_size < num_tri]
 
-    edges = np.vstack([e0, e1, e2])
-    edges = np.sort(edges, axis=1)
+        keys_list = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as exe:
+            futures = [exe.submit(_edge_keys_from_tri_chunk, c) for c in chunks]
+            for f in concurrent.futures.as_completed(futures):
+                keys_list.append(f.result())
 
-    # WIRE FRAME
-    if wireframe:
-        uniq = np.unique(edges, axis=0)
-        return [(vertices[a], vertices[b]) for a, b in uniq]
+        if keys_list:
+            all_keys = np.concatenate(keys_list)
+        else:
+            all_keys = np.empty(0, dtype=np.uint64)
+    else:
+        # standardowy szybki wektorowy wariant (jednowątkowy lub numba later)
+        e0 = tri[:, [0, 1]]
+        e1 = tri[:, [1, 2]]
+        e2 = tri[:, [2, 0]]
+        edges = np.vstack([e0, e1, e2])
+        mins = np.minimum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+        maxs = np.maximum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+        all_keys = (mins << np.uint64(32)) | maxs
 
-    # OUTLINE: krawędzie które występują tylko raz
-    a = edges[:, 0].astype(np.uint64)
-    b = edges[:, 1].astype(np.uint64)
-    keys = (a << 32) | b
+    if all_keys.size == 0:
+        return []
 
-    uniq_keys, counts = np.unique(keys, return_counts=True)
+    uniq_keys, counts = np.unique(all_keys, return_counts=True)
+
+    # Wyciągamy tylko "jednostronne" krawędzie — czyli outline
     boundary_keys = uniq_keys[counts == 1]
 
     if len(boundary_keys) == 0:
         return []
 
+    # Odtwarzamy pary vertexów
     boundary = np.column_stack([
         (boundary_keys >> 32).astype(np.int32),
-        (boundary_keys & 0xFFFFFFFF).astype(np.int32)
+        (boundary_keys & np.uint64(0xFFFFFFFF)).astype(np.int32)
     ])
 
     # ŁĄCZENIE W ŁAŃCUCHY
