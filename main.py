@@ -15,7 +15,7 @@ import math
 
 # Opcjonalne: Numba dla przyspieszenia
 try:
-    from numba import jit, prange
+    from numba import jit, prange, njit
     NUMBA_AVAILABLE = True
 except ImportError:
     NUMBA_AVAILABLE = False
@@ -60,23 +60,24 @@ def measure_time(func):
 # Funkcje Numba
 # ---------------------
 if NUMBA_AVAILABLE:
-    @jit(nopython=True, parallel=True, cache=True)
+    @njit(cache=True, fastmath=True)
     def compute_backface_culling_numba(centers, normals, camera_pos, threshold):
-        n = len(centers)
-        visible = np.zeros(n, dtype=np.bool_)
-        for i in prange(n):
-            view_dir = camera_pos - centers[i]
-            view_len = np.sqrt(view_dir[0]**2 + view_dir[1]**2 + view_dir[2]**2)
-            if view_len > 0:
-                view_dir = view_dir / view_len
-                dot_prod = normals[i, 0]*view_dir[0] + normals[i, 1]*view_dir[1] + normals[i, 2]*view_dir[2]
-                visible[i] = dot_prod > threshold
-        return visible
+        """Numba-accelerated backface culling (szybciej)."""
+        n = centers.shape[0]
+        out = np.zeros(n, dtype=np.bool_)
+        cx = camera_pos[0]; cy = camera_pos[1]; cz = camera_pos[2]
+        for i in range(n):
+            dx = cx - centers[i, 0]
+            dy = cy - centers[i, 1]
+            dz = cz - centers[i, 2]
+            dot = normals[i, 0] * dx + normals[i, 1] * dy + normals[i, 2] * dz
+            out[i] = dot > threshold
+        return out
 
     @jit(nopython=True, cache=True)
     def find_nearest_numba(current_end, starts, ends, used_mask):
         best_idx, best_dist, flip = -1, np.inf, False
-        for i in range(len(starts)):
+        for i in prange(len(starts)):
             if used_mask[i]:
                 continue
             d = current_end - starts[i]
@@ -90,7 +91,7 @@ if NUMBA_AVAILABLE:
         return best_idx, flip
 
 # ---------------------
-# Pomocnicze funkcje
+# Pomocnicze funkcje (zastąpione szybszymi implementacjami)
 # ---------------------
 def backface_culling(centers, normals, camera_pos, threshold):
     """Backface culling - Numba lub NumPy"""
@@ -176,150 +177,117 @@ def _filter_short_chains(vertices, edges, min_chain_len, min_segments):
                 out_lines.append((chain[i].copy(), chain[i+1].copy()))
     return out_lines
 
-def remove_artifacts(lines, min_seg_len=None, min_chain_len=None, min_segments=None):
-    """
-    Usuwa krótkie pojedyncze segmenty oraz krótkie łańcuchy.
-    Zwraca przefiltrowaną listę linii.
-    """
+def remove_artifacts(lines, min_len=1e-6):
+    """Prosty, szybki filtr krótkich/degenerate segmentów."""
     if not lines:
         return []
-    if min_seg_len is None:
-        min_seg_len = Config.MIN_SEGMENT_LENGTH
-    if min_chain_len is None:
-        min_chain_len = Config.MIN_CHAIN_LENGTH
-    if min_segments is None:
-        min_segments = Config.MIN_SEGMENTS_IN_CHAIN
-
-    vertices, edges = _lines_to_graph(lines, quant=4)
-    # Usuń wiszące krótkie odcinki
-    pruned = _prune_short_dangles(vertices, edges, min_seg_len)
-    # Filtruj krótkie łańcuchy
-    clean = _filter_short_chains(vertices, pruned, min_chain_len, min_segments)
-    if clean:
-        return clean
-    # Fallback: usuń tylko krótkie pojedyncze segmenty
-    return [ln for ln in lines if np.linalg.norm(ln[1] - ln[0]) >= min_seg_len]
+    out = []
+    for p0, p1 in lines:
+        try:
+            if np.linalg.norm(p1 - p0) >= min_len:
+                out.append((p0, p1))
+        except Exception:
+            # w razie nieoczekiwanych typów - pomijamy
+            continue
+    return out
 
 def chain_segments(edges, vertices):
-    """Łączy krawędzie w ciągłe łańcuchy - ulepszona wersja dla lepszej ciągłości"""
+    """
+    Szybsza wersja budowania łańcuchów z listy krawędzi.
+    edges: list of [a,b]
+    Zwraca listę chainów jako listę punktów 3D.
+    """
     if not edges:
         return []
-    
-    # Buduj graf sąsiedztwa
-    adj = defaultdict(list)
-    for v1, v2 in edges:
-        adj[v1].append(v2)
-        adj[v2].append(v1)
-    
+    # Budujemy adjacency map vertex -> lista sąsiadów
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    visited = set()
     chains = []
-    visited_edges = set()
-    
-    # Znajdź wierzchołki o nieparzystym stopniu (końce łańcuchów)
-    odd_vertices = [v for v, neighbors in adj.items() if len(neighbors) % 2 == 1]
-    
-    # Jeśli nie ma wierzchołków o nieparzystym stopniu, wybierz dowolny
-    start_vertices = odd_vertices if odd_vertices else list(adj.keys())
-    
-    for start in start_vertices[:]:
-        if start not in adj or not adj[start]:
+
+    for start in list(adj.keys()):
+        if start in visited:
             continue
-            
-        # Użyj DFS dla lepszej ciągłości
-        stack = [start]
-        chain = []
-        
-        while stack:
-            curr = stack[-1]
-            if adj[curr]:
-                next_node = adj[curr].pop()
-                if next_node in adj and curr in adj[next_node]:
-                    adj[next_node].remove(curr)
-                
-                edge_key = tuple(sorted([curr, next_node]))
-                if edge_key not in visited_edges:
-                    visited_edges.add(edge_key)
-                    stack.append(next_node)
-            else:
-                chain.append(stack.pop())
-        
-        if len(chain) > 1:
-            # Konwertuj indeksy wierzchołków na współrzędne
-            coord_chain = [vertices[i] for i in chain]
-            chains.append(coord_chain)
-    
-    # Dodaj pozostałe cykle
-    remaining_vertices = [v for v in adj if adj[v]]
-    while remaining_vertices:
-        start = remaining_vertices[0]
-        stack = [start]
-        chain = []
-        
-        while stack:
-            curr = stack[-1]
-            if adj[curr]:
-                next_node = adj[curr].pop()
-                if next_node in adj and curr in adj[next_node]:
-                    adj[next_node].remove(curr)
-                
-                edge_key = tuple(sorted([curr, next_node]))
-                if edge_key not in visited_edges:
-                    visited_edges.add(edge_key)
-                    stack.append(next_node)
-            else:
-                chain.append(stack.pop())
-        
-        if len(chain) > 1:
-            coord_chain = [vertices[i] for i in chain]
-            chains.append(coord_chain)
-        
-        remaining_vertices = [v for v in adj if adj[v]]
-    
+
+        # zbieramy łańcuch rozciągając się na oba końce
+        chain_idx = [start]
+        visited.add(start)
+
+        # rozwiń w prawo
+        cur = start
+        while True:
+            nxts = [v for v in adj.get(cur, []) if v not in visited]
+            if not nxts:
+                break
+            nxt = nxts[0]
+            visited.add(nxt)
+            chain_idx.append(nxt)
+            cur = nxt
+
+        # rozwiń w lewo
+        cur = start
+        left = []
+        while True:
+            nxts = [v for v in adj.get(cur, []) if v not in visited]
+            if not nxts:
+                break
+            nxt = nxts[0]
+            visited.add(nxt)
+            left.append(nxt)
+            cur = nxt
+
+        if left:
+            chain_idx = left[::-1] + chain_idx
+
+        pts = [vertices[i] for i in chain_idx]
+        chains.append(pts)
+
     return chains
 
 def optimize_chain_order(chains):
-    """Optymalizuje kolejność łańcuchów dla minimalnego czasu podróży"""
-    if not chains:
-        return []
-    
-    ordered = []
-    remaining = chains[:]
-    current_pos = np.array([0, 0, 0])  # Start od środka
-    
-    while remaining:
-        best_idx = 0
-        best_dist = float('inf')
-        best_reverse = False
-        
-        for i, chain in enumerate(remaining):
-            # Sprawdź odległość do początku łańcucha
-            dist_start = np.linalg.norm(current_pos - chain[0])
-            # Sprawdź odległość do końca łańcucha  
-            dist_end = np.linalg.norm(current_pos - chain[-1])
-            
-            if dist_start < best_dist:
-                best_dist = dist_start
-                best_idx = i
-                best_reverse = False
-            if dist_end < best_dist:
-                best_dist = dist_end
-                best_idx = i
-                best_reverse = True
-        
-        selected_chain = remaining.pop(best_idx)
-        if best_reverse:
-            selected_chain = selected_chain[::-1]
-        
-        ordered.append(selected_chain)
-        current_pos = selected_chain[-1]
-    
+    """Lekka heurystyka minimalizująca przeskoki między łańcuchami."""
+    if not chains or len(chains) <= 1:
+        return chains
+
+    ordered = [chains.pop(0)]
+
+    while chains:
+        last_pt = np.asarray(ordered[-1][-1])
+        best_i = None
+        best_d = 1e20
+        reverse = False
+
+        for i, c in enumerate(chains):
+            c0 = np.asarray(c[0])
+            c1 = np.asarray(c[-1])
+            d0 = np.linalg.norm(last_pt - c0)
+            d1 = np.linalg.norm(last_pt - c1)
+
+            if d0 < best_d:
+                best_d = d0
+                best_i = i
+                reverse = False
+            if d1 < best_d:
+                best_d = d1
+                best_i = i
+                reverse = True
+
+        chain = chains.pop(best_i)
+        if reverse:
+            chain = chain[::-1]
+        ordered.append(chain)
+
     return ordered
 
 # ---------------------
-# Generowanie linii - ULEPSZONE
+# Generowanie linii - ULEPSZONE (szybsza wersja)
 # ---------------------
 @measure_time
 def generate_lines_from_mesh(mesh, camera_pos, threshold=0.1, wireframe=False):
-    """Szybsza, stabilna wersja outline/wireframe z naprawą błędu dtype.view."""
+    """Szybsza, stabilna wersja outline/wireframe."""
 
     vertices = np.asarray(mesh.vertices)
     tri = np.asarray(mesh.triangles)
@@ -330,84 +298,55 @@ def generate_lines_from_mesh(mesh, camera_pos, threshold=0.1, wireframe=False):
     normals = np.asarray(mesh.triangle_normals)
     centers = vertices[tri].mean(axis=1)
 
-    # ---------------------------
-    #   BACKFACE CULLING
-    # ---------------------------
+    # BACKFACE CULLING (wrapper wywoła compute_backface_culling_numba gdy numba dostępna)
     visible = backface_culling(centers, normals, camera_pos, threshold)
     if not np.any(visible):
         return []
 
     tri = tri[visible]
 
-    # ---------------------------
-    #   GENEROWANIE KRAWĘDZI
-    # ---------------------------
-    # Szybkie tworzenie listy krawędzi
+    # GENEROWANIE KRAWĘDZI
     e0 = tri[:, [0, 1]]
     e1 = tri[:, [1, 2]]
     e2 = tri[:, [2, 0]]
 
     edges = np.vstack([e0, e1, e2])
-    edges = np.sort(edges, axis=1)  # sortowanie dla stabilności
+    edges = np.sort(edges, axis=1)
 
-    # ---------------------------
-    #   WIRE FRAME (wszystkie krawędzie)
-    # ---------------------------
+    # WIRE FRAME
     if wireframe:
         uniq = np.unique(edges, axis=0)
         return [(vertices[a], vertices[b]) for a, b in uniq]
 
-    # ==============================================================
-    #   OUTLINE: Krawędzie, które występują TYLKO RAZ
-    #   (poprawiona wersja — bez dtype.view, bez błędów pamięci)
-    # ==============================================================
-
-    # Krawędzie jako 64-bitowy klucz
+    # OUTLINE: krawędzie które występują tylko raz
     a = edges[:, 0].astype(np.uint64)
     b = edges[:, 1].astype(np.uint64)
     keys = (a << 32) | b
 
     uniq_keys, counts = np.unique(keys, return_counts=True)
-
-    # Wyciągamy tylko "jednostronne" krawędzie — czyli outline
     boundary_keys = uniq_keys[counts == 1]
 
     if len(boundary_keys) == 0:
         return []
 
-    # Odtwarzamy pary vertexów
     boundary = np.column_stack([
         (boundary_keys >> 32).astype(np.int32),
         (boundary_keys & 0xFFFFFFFF).astype(np.int32)
     ])
 
-    # ---------------------------
-    #   ŁĄCZENIE KRAWĘDZI W ŁAŃCUCHY
-    # ---------------------------
+    # ŁĄCZENIE W ŁAŃCUCHY
     chains = chain_segments(boundary.tolist(), vertices)
-
     if not chains:
-        # fallback: zwróć surowe krawędzie
         return [(vertices[a], vertices[b]) for a, b in boundary]
 
-    # ---------------------------
-    #   OPTYMALIZACJA KOLEJNOŚCI
-    # ---------------------------
     chains = optimize_chain_order(chains)
 
-    # ---------------------------
-    #   KONWERSJA W LINIE 3D
-    # ---------------------------
+    # KONWERSJA NA LINIE
     lines = []
-    append = lines.append
-
     for chain in chains:
         for i in range(len(chain) - 1):
-            append((chain[i], chain[i + 1]))
+            lines.append((chain[i], chain[i + 1]))
 
-    # ---------------------------
-    #   USUWANIE ARTEFAKTÓW
-    # ---------------------------
     return remove_artifacts(lines)
 
 @measure_time
