@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 import svgwrite
 import xml.etree.ElementTree as ET
 import math
-import concurrent.futures
+from multiprocessing.dummy import Pool as ThreadPool
 
 # Opcjonalne: Numba dla przyspieszenia
 try:
@@ -342,17 +342,17 @@ def generate_lines_from_mesh(mesh, camera_pos, threshold=0.1, wireframe=False):
     # GENEROWANIE KRAWĘDZI + klucze — zoptymalizowane dla bardzo dużych siatek
     num_tri = len(tri)
     if num_tri > LARGE_MESH_TRI and not NUMBA_AVAILABLE:
-        # wielowątkowe budowanie kluczy na kawałkach (ThreadPool, bo numpy wektoryzuje pracę)
+        # wielowątkowe budowanie kluczy na kawałkach (ThreadPool)
         n_workers = min(8, (os.cpu_count() or 4))
-        # dzielimy na równomierne chunki
         chunk_size = (num_tri + n_workers - 1) // n_workers
         chunks = [tri[i*chunk_size:(i+1)*chunk_size] for i in range(n_workers) if i*chunk_size < num_tri]
 
-        keys_list = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as exe:
-            futures = [exe.submit(_edge_keys_from_tri_chunk, c) for c in chunks]
-            for f in concurrent.futures.as_completed(futures):
-                keys_list.append(f.result())
+        pool = ThreadPool(n_workers)
+        try:
+            keys_list = pool.map(_edge_keys_from_tri_chunk, chunks)
+        finally:
+            pool.close()
+            pool.join()
 
         if keys_list:
             all_keys = np.concatenate(keys_list)
@@ -1034,6 +1034,27 @@ def generate_orig_optimized(original_mesh, camera_pos, view_dir, threshold=0.1, 
     # usuń artefakty (krótkie segmenty/łańcuchy)
     lines = remove_artifacts(lines)
     return lines
+
+def _edge_keys_from_tri_chunk(tri_chunk):
+    """
+    tri_chunk: (M,3) numpy array
+    Zwraca 1D numpy array dtype=np.uint64 z kluczami (min<<32 | max)
+    reprezentującymi posortowane pary wierzchołków.
+    """
+    if tri_chunk is None or tri_chunk.size == 0:
+        return np.empty(0, dtype=np.uint64)
+
+    # trzy zestawy krawędzi
+    e0 = tri_chunk[:, [0, 1]]
+    e1 = tri_chunk[:, [1, 2]]
+    e2 = tri_chunk[:, [2, 0]]
+    edges = np.vstack([e0, e1, e2])
+
+    # uporządkuj pary (min, max) i zbuduj 64-bitowy klucz
+    mins = np.minimum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+    maxs = np.maximum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+    keys = (mins << np.uint64(32)) | maxs
+    return keys
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Mesh -> Robot Path')
