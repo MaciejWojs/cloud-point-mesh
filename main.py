@@ -156,6 +156,82 @@ def _prune_short_dangles(vertices, edges, min_len, max_iter=10):
             if a in adj[b]: adj[b].remove(a)
     return [tuple(e) for e in edge_set]
 
+def chain_segments(edges, vertices):
+    """Łączy krawędzie w ciągłe łańcuchy - ulepszona wersja dla lepszej ciągłości"""
+    if not edges:
+        return []
+    
+    # Buduj graf sąsiedztwa
+    adj = defaultdict(list)
+    for v1, v2 in edges:
+        adj[v1].append(v2)
+        adj[v2].append(v1)
+    
+    chains = []
+    visited_edges = set()
+    
+    # Znajdź wierzchołki o nieparzystym stopniu (końce łańcuchów)
+    odd_vertices = [v for v, neighbors in adj.items() if len(neighbors) % 2 == 1]
+    
+    # Jeśli nie ma wierzchołków o nieparzystym stopniu, wybierz dowolny
+    start_vertices = odd_vertices if odd_vertices else list(adj.keys())
+    
+    for start in start_vertices[:]:
+        if start not in adj or not adj[start]:
+            continue
+            
+        # Użyj DFS dla lepszej ciągłości
+        stack = [start]
+        chain = []
+        
+        while stack:
+            curr = stack[-1]
+            if adj[curr]:
+                next_node = adj[curr].pop()
+                if next_node in adj and curr in adj[next_node]:
+                    adj[next_node].remove(curr)
+                
+                edge_key = tuple(sorted([curr, next_node]))
+                if edge_key not in visited_edges:
+                    visited_edges.add(edge_key)
+                    stack.append(next_node)
+            else:
+                chain.append(stack.pop())
+        
+        if len(chain) > 1:
+            # Konwertuj indeksy wierzchołków na współrzędne
+            coord_chain = [vertices[i] for i in chain]
+            chains.append(coord_chain)
+    
+    # Dodaj pozostałe cykle
+    remaining_vertices = [v for v in adj if adj[v]]
+    while remaining_vertices:
+        start = remaining_vertices[0]
+        stack = [start]
+        chain = []
+        
+        while stack:
+            curr = stack[-1]
+            if adj[curr]:
+                next_node = adj[curr].pop()
+                if next_node in adj and curr in adj[next_node]:
+                    adj[next_node].remove(curr)
+                
+                edge_key = tuple(sorted([curr, next_node]))
+                if edge_key not in visited_edges:
+                    visited_edges.add(edge_key)
+                    stack.append(next_node)
+            else:
+                chain.append(stack.pop())
+        
+        if len(chain) > 1:
+            coord_chain = [vertices[i] for i in chain]
+            chains.append(coord_chain)
+        
+        remaining_vertices = [v for v in adj if adj[v]]
+    
+    return chains
+
 def _filter_short_chains(vertices, edges, min_chain_len, min_segments):
     """
     Buduje łańcuchy (chain_segments) i odrzuca te krótsze niż min_chain_len
@@ -177,75 +253,29 @@ def _filter_short_chains(vertices, edges, min_chain_len, min_segments):
                 out_lines.append((chain[i].copy(), chain[i+1].copy()))
     return out_lines
 
-def remove_artifacts(lines, min_len=1e-6):
-    """Prosty, szybki filtr krótkich/degenerate segmentów."""
+def remove_artifacts(lines, min_seg_len=None, min_chain_len=None, min_segments=None):
+    """
+    Usuwa krótkie pojedyncze segmenty oraz krótkie łańcuchy.
+    Zwraca przefiltrowaną listę linii.
+    """
     if not lines:
         return []
-    out = []
-    for p0, p1 in lines:
-        try:
-            if np.linalg.norm(p1 - p0) >= min_len:
-                out.append((p0, p1))
-        except Exception:
-            # w razie nieoczekiwanych typów - pomijamy
-            continue
-    return out
+    if min_seg_len is None:
+        min_seg_len = Config.MIN_SEGMENT_LENGTH
+    if min_chain_len is None:
+        min_chain_len = Config.MIN_CHAIN_LENGTH
+    if min_segments is None:
+        min_segments = Config.MIN_SEGMENTS_IN_CHAIN
 
-def chain_segments(edges, vertices):
-    """
-    Szybsza wersja budowania łańcuchów z listy krawędzi.
-    edges: list of [a,b]
-    Zwraca listę chainów jako listę punktów 3D.
-    """
-    if not edges:
-        return []
-    # Budujemy adjacency map vertex -> lista sąsiadów
-    adj = {}
-    for a, b in edges:
-        adj.setdefault(a, []).append(b)
-        adj.setdefault(b, []).append(a)
-
-    visited = set()
-    chains = []
-
-    for start in list(adj.keys()):
-        if start in visited:
-            continue
-
-        # zbieramy łańcuch rozciągając się na oba końce
-        chain_idx = [start]
-        visited.add(start)
-
-        # rozwiń w prawo
-        cur = start
-        while True:
-            nxts = [v for v in adj.get(cur, []) if v not in visited]
-            if not nxts:
-                break
-            nxt = nxts[0]
-            visited.add(nxt)
-            chain_idx.append(nxt)
-            cur = nxt
-
-        # rozwiń w lewo
-        cur = start
-        left = []
-        while True:
-            nxts = [v for v in adj.get(cur, []) if v not in visited]
-            if not nxts:
-                break
-            nxt = nxts[0]
-            visited.add(nxt)
-            left.append(nxt)
-            cur = nxt
-
-        if left:
-            chain_idx = left[::-1] + chain_idx
-
-        pts = [vertices[i] for i in chain_idx]
-        chains.append(pts)
-
-    return chains
+    vertices, edges = _lines_to_graph(lines, quant=4)
+    # Usuń wiszące krótkie odcinki
+    pruned = _prune_short_dangles(vertices, edges, min_seg_len)
+    # Filtruj krótkie łańcuchy
+    clean = _filter_short_chains(vertices, pruned, min_chain_len, min_segments)
+    if clean:
+        return clean
+    # Fallback: usuń tylko krótkie pojedyncze segmenty
+    return [ln for ln in lines if np.linalg.norm(ln[1] - ln[0]) >= min_seg_len]
 
 def optimize_chain_order(chains):
     """Lekka heurystyka minimalizująca przeskoki między łańcuchami."""
