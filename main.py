@@ -534,13 +534,42 @@ def create_wireframe_render(mesh, camera_pos, look_at, output_path, width, heigh
     if lines_3d:
         draw_robot_path_lines(img, lines_3d, view_dir, width, height)
     
-    # Dodaj informacje i osie
     add_info_panel(img, mesh, lines_3d, axis_labels)
     add_coordinate_axes(img, view_dir)
-    
+
     cv2.imwrite(output_path, img)
     print(f"Wireframe 2D zapisany: {output_path}")
     return output_path
+
+def add_info_panel(img, mesh, lines_3d, axis_labels):
+    """Krótki opis siatki w rogu zapasowego rysunku 2D."""
+    line_count = 0 if not lines_3d else len(lines_3d)
+    lines = [
+        f"Vertices: {len(mesh.vertices)}  Triangles: {len(mesh.triangles)}",
+        f"Drawing segments: {line_count}",
+        f"Axes: {axis_labels[0]} / {axis_labels[1]}",
+    ]
+    y = 28
+    for text in lines:
+        cv2.putText(img, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+        y += 24
+
+
+def add_coordinate_axes(img, view_dir):
+    """Mała legenda osi w lewym dolnym rogu."""
+    if abs(view_dir[2]) > 0.7:
+        labels = ("X", "Y")
+    elif abs(view_dir[1]) > 0.7:
+        labels = ("X", "Z")
+    else:
+        labels = ("Y", "Z")
+
+    origin = (48, img.shape[0] - 48)
+    cv2.arrowedLine(img, origin, (origin[0] + 70, origin[1]), (80, 80, 255), 2, cv2.LINE_AA)
+    cv2.arrowedLine(img, origin, (origin[0], origin[1] - 70), (80, 255, 80), 2, cv2.LINE_AA)
+    cv2.putText(img, labels[0], (origin[0] + 76, origin[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, labels[1], (origin[0] - 4, origin[1] - 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 80), 1, cv2.LINE_AA)
+
 
 def create_gradient_background(width, height):
     """Tworzy gradientowe tło"""
