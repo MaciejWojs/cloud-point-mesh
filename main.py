@@ -161,80 +161,60 @@ def _prune_short_dangles(vertices, edges, min_len, max_iter=10):
             if a in adj[b]: adj[b].remove(a)
     return [tuple(e) for e in edge_set]
 
+def _walk_unused_edges(adj, start):
+    """Jedno przejście po niewykorzystanych krawędziach. Zwraca łańcuch indeksów."""
+    stack = [start]
+    chain = []
+    while stack:
+        curr = stack[-1]
+        neighbors = adj[curr]
+        if neighbors:
+            next_node = neighbors.pop()
+            other = adj.get(next_node)
+            if other:
+                try:
+                    other.remove(curr)
+                except ValueError:
+                    pass
+            stack.append(next_node)
+        else:
+            chain.append(stack.pop())
+    return chain
+
+
 def chain_segments(edges, vertices):
-    """Łączy krawędzie w ciągłe łańcuchy - ulepszona wersja dla lepszej ciągłości"""
+    """Łączy krawędzie w ciągłe łańcuchy. Jedno przejście po grafie, bez skanowania go od nowa."""
     if not edges:
         return []
-    
-    # Buduj graf sąsiedztwa
+
     adj = defaultdict(list)
     for v1, v2 in edges:
         adj[v1].append(v2)
         adj[v2].append(v1)
-    
+
+    def take(start):
+        if not adj.get(start):
+            return None
+        chain = _walk_unused_edges(adj, start)
+        if len(chain) < 2:
+            return None
+        return [vertices[i] for i in chain]
+
     chains = []
-    visited_edges = set()
-    
-    # Znajdź wierzchołki o nieparzystym stopniu (końce łańcuchów)
     odd_vertices = [v for v, neighbors in adj.items() if len(neighbors) % 2 == 1]
-    
-    # Jeśli nie ma wierzchołków o nieparzystym stopniu, wybierz dowolny
     start_vertices = odd_vertices if odd_vertices else list(adj.keys())
-    
-    for start in start_vertices[:]:
-        if start not in adj or not adj[start]:
-            continue
-            
-        # Użyj DFS dla lepszej ciągłości
-        stack = [start]
-        chain = []
-        
-        while stack:
-            curr = stack[-1]
-            if adj[curr]:
-                next_node = adj[curr].pop()
-                if next_node in adj and curr in adj[next_node]:
-                    adj[next_node].remove(curr)
-                
-                edge_key = tuple(sorted([curr, next_node]))
-                if edge_key not in visited_edges:
-                    visited_edges.add(edge_key)
-                    stack.append(next_node)
-            else:
-                chain.append(stack.pop())
-        
-        if len(chain) > 1:
-            # Konwertuj indeksy wierzchołków na współrzędne
-            coord_chain = [vertices[i] for i in chain]
-            chains.append(coord_chain)
-    
-    # Dodaj pozostałe cykle
-    remaining_vertices = [v for v in adj if adj[v]]
-    while remaining_vertices:
-        start = remaining_vertices[0]
-        stack = [start]
-        chain = []
-        
-        while stack:
-            curr = stack[-1]
-            if adj[curr]:
-                next_node = adj[curr].pop()
-                if next_node in adj and curr in adj[next_node]:
-                    adj[next_node].remove(curr)
-                
-                edge_key = tuple(sorted([curr, next_node]))
-                if edge_key not in visited_edges:
-                    visited_edges.add(edge_key)
-                    stack.append(next_node)
-            else:
-                chain.append(stack.pop())
-        
-        if len(chain) > 1:
-            coord_chain = [vertices[i] for i in chain]
-            chains.append(coord_chain)
-        
-        remaining_vertices = [v for v in adj if adj[v]]
-    
+    for start in start_vertices:
+        chain = take(start)
+        if chain:
+            chains.append(chain)
+
+    # Reszta to cykle. Lista jest zrobiona raz: w trakcie tylko ubywają krawędzie.
+    pending = [v for v, neighbors in adj.items() if neighbors]
+    for start in pending:
+        chain = take(start)
+        if chain:
+            chains.append(chain)
+
     return chains
 
 def _filter_short_chains(vertices, edges, min_chain_len, min_segments):
@@ -768,23 +748,36 @@ def render_svg(lines, output_path, view_dir, logo_type=None):
 # ---------------------
 # Eksport i skalowanie - ZMODYFIKOWANE
 # ---------------------
+def _clone_mesh(mesh):
+    clone = o3d.geometry.TriangleMesh()
+    clone.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices))
+    clone.triangles = o3d.utility.Vector3iVector(np.asarray(mesh.triangles))
+    return clone
+
+
 @measure_time
 def load_and_scale_mesh(path, max_triangles=None):
-    """Wczytuje i skaluje mesh – zoptymalizowana wersja (2–5× szybsza)."""
+    """Wczytuje mesh, tnie go do limitu rysunku i skaluje na kartkę."""
     mesh = o3d.io.read_triangle_mesh(path)
+    loaded = len(mesh.triangles)
 
-    # Zachowaj tylko kopię geometrii wierzchołków – nie całego mesha
-    original_vertices = np.asarray(mesh.vertices).copy()
-    original_triangles = np.asarray(mesh.triangles).copy()
+    # Pełna siatka (setki tysięcy trójkątów) nie idzie do łączenia krawędzi.
+    # Kontur trzyma więcej szczegółu niż wersja pod szybki podgląd.
+    outline_limit = Config.MAX_TRIANGLES_OUTLINE
+    if outline_limit and loaded > outline_limit:
+        mesh = mesh.simplify_quadric_decimation(outline_limit)
+        print(f"Outline decimation: {loaded} → {len(mesh.triangles)}")
 
-    # Uproszczenie (duże przyspieszenie – nie liczymy nic podwójnie)
-    if max_triangles and len(mesh.triangles) > max_triangles:
-        mesh = mesh.simplify_quadric_decimation(max_triangles)
-        print(f"Decimation: {len(original_triangles)} → {len(mesh.triangles)}")
-
-    # Wyczyszczenie tylko tego, co niezbędne
     mesh.remove_unreferenced_vertices()
+    simplified = _clone_mesh(mesh)
+    if max_triangles and len(simplified.triangles) > max_triangles:
+        before = len(simplified.triangles)
+        simplified = simplified.simplify_quadric_decimation(max_triangles)
+        print(f"Decimation: {before} → {len(simplified.triangles)}")
+
     mesh.compute_triangle_normals()
+    simplified.remove_unreferenced_vertices()
+    simplified.compute_triangle_normals()
 
     # --- Skalowanie ---
     paper_w, paper_h = Config.PAPER_SIZES[Config.PAPER_FORMAT]
@@ -817,17 +810,13 @@ def load_and_scale_mesh(path, max_triangles=None):
     ]
 
     mesh.transform(T)
+    simplified.transform(T)
+    mesh.compute_triangle_normals()
+    simplified.compute_triangle_normals()
 
-    # Zastosuj tę samą transformację do oryginalnego mesha
-    original = o3d.geometry.TriangleMesh()
-    original.vertices = o3d.utility.Vector3dVector(original_vertices)
-    original.triangles = o3d.utility.Vector3iVector(original_triangles)
-    original.transform(T)
-    original.compute_triangle_normals()
+    print(f"Mesh scaled: scale={scale:.3f}, outline={len(mesh.triangles)}, preview={len(simplified.triangles)}")
 
-    print(f"Mesh scaled: scale={scale:.3f}, triangles={len(mesh.triangles)}")
-
-    return original, mesh
+    return mesh, simplified
 
 # ---------------------
 # Main - ZMODYFIKOWANE
