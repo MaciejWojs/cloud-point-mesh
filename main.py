@@ -16,7 +16,11 @@ class Config:
     OUTPUT_DIR = "./output"
     VOXEL_SIZE = 0.02
     POISSON_DEPTH = 10
-    SIMPLIFICATION_RATIO = 0.25
+    SMOOTH_ITERATIONS = 1
+    # Krawędź zostaje, gdy sąsiednie ściany łamią się o co najmniej tyle stopni.
+    CREASE_ANGLE_DEG = 35.0
+    # Uproszczenie brzegu: punkt odpada, gdy leży bliżej cięciwy niż tyle wokseli.
+    EDGE_SIMPLIFY_VOXELS = 0.5
     VISIBILITY_THRESHOLD = 0.1
     IMAGE_WIDTH = 1920
     IMAGE_HEIGHT = 1080
@@ -184,16 +188,20 @@ def build_mesh(points, method="poisson", depth=10, simplify=True):
             vertices_to_keep = densities > density_threshold
             mesh = mesh.select_by_index(np.where(vertices_to_keep)[0])
     
-    # Wygładzanie
+    # Jedno przejście Taubina zamiast kilku Laplace'a: mniej kurczy powierzchnię.
     print("Wygładzanie meshu...")
-    mesh = mesh.filter_smooth_laplacian(number_of_iterations=3)
-    mesh = mesh.filter_smooth_taubin(number_of_iterations=3)
-    
-    # Uproszczenie
-    if simplify and len(mesh.triangles) > 1000:
-        target_triangles = max(1000, int(len(mesh.triangles) * Config.SIMPLIFICATION_RATIO))
-        print(f"Upraszczanie meshu do {target_triangles} trójkątów...")
-        mesh = mesh.simplify_quadric_decimation(target_triangles)
+    mesh = mesh.filter_smooth_taubin(number_of_iterations=Config.SMOOTH_ITERATIONS)
+
+    # Zwijaj tylko trójkąty, których błąd jest mniejszy niż woksel.
+    # Brzeg ma dużą wagę, żeby kontur nie uciekł od chmury punktów.
+    if simplify and len(mesh.triangles) > 1:
+        before = len(mesh.triangles)
+        mesh = mesh.simplify_quadric_decimation(
+            target_number_of_triangles=1,
+            maximum_error=float(Config.VOXEL_SIZE ** 2),
+            boundary_weight=10.0,
+        )
+        print(f"Uproszczenie siatki w budżecie błędu: {before} -> {len(mesh.triangles)} trójkątów")
     
     # Oblicz normalne
     mesh.compute_vertex_normals()
@@ -206,120 +214,186 @@ def build_mesh(points, method="poisson", depth=10, simplify=True):
 # Generowanie linii 3D z meshu
 # ---------------------
 @measure_time
-def generate_simplified_lines_from_mesh(mesh, camera_position, threshold=0.1):
-    """Generuje uproszczone linie 3D z widocznych krawędzi meshu"""
+def extract_feature_edges(mesh, camera_position, threshold=0.1, crease_deg=35.0):
+    """Brzeg widocznej powierzchni i ostre załamania. Płaskie krawędzie wewnętrzne odpadają."""
     if len(mesh.triangles) == 0:
         print("Mesh nie zawiera trójkątów")
         return []
 
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
-    
-    # Oblicz normalne trójkątów jeśli nie są dostępne
+
     if len(mesh.triangle_normals) == 0:
         mesh.compute_triangle_normals()
     normals = np.asarray(mesh.triangle_normals)
-    
-    # Środki trójkątów i wektory do kamery
+
     centers = np.mean(vertices[triangles], axis=1)
     view_dirs = camera_position - centers
-    view_dirs_norm = view_dirs / np.linalg.norm(view_dirs, axis=1, keepdims=True)
-    
-    # Test widoczności (backface culling)
-    dot_products = np.einsum('ij,ij->i', normals, view_dirs_norm)
-    visible_triangles = triangles[dot_products > threshold]
-    
+    view_dirs /= np.linalg.norm(view_dirs, axis=1, keepdims=True)
+    visible = np.einsum("ij,ij->i", normals, view_dirs) > threshold
+    visible_triangles = triangles[visible]
+    visible_normals = normals[visible]
+
     if len(visible_triangles) == 0:
         print("Brak widocznych trójkątów")
         return []
-    
-    # Zbierz wszystkie krawędzie widocznych trójkątów
-    edges_set = set()
-    for tri in visible_triangles:
-        edges_set.add(tuple(sorted([tri[0], tri[1]])))
-        edges_set.add(tuple(sorted([tri[1], tri[2]])))
-        edges_set.add(tuple(sorted([tri[2], tri[0]])))
-    
-    # Konwertuj na linie 3D
-    lines_3d = [(vertices[e[0]], vertices[e[1]]) for e in edges_set]
-    
-    print(f"Wygenerowano {len(lines_3d)} linii 3D z {len(visible_triangles)} widocznych trójkątów")
+
+    edge_faces = {}
+    for face_index, tri in enumerate(visible_triangles):
+        corners = (int(tri[0]), int(tri[1]), int(tri[2]))
+        for a, b in ((corners[0], corners[1]), (corners[1], corners[2]), (corners[2], corners[0])):
+            edge_faces.setdefault((a, b) if a < b else (b, a), []).append(face_index)
+
+    crease = np.deg2rad(crease_deg)
+    kept = []
+    for (i, j), faces in edge_faces.items():
+        if len(faces) == 1:
+            kept.append((i, j))
+            continue
+        n0 = visible_normals[faces[0]]
+        n1 = visible_normals[faces[1]]
+        angle = np.arccos(np.clip(np.dot(n0, n1), -1.0, 1.0))
+        if angle >= crease:
+            kept.append((i, j))
+
+    lines_3d = [(vertices[i], vertices[j]) for i, j in kept]
+    print(
+        f"Krawędzie rysunku: {len(lines_3d)} z {len(edge_faces)} "
+        f"({len(visible_triangles)} widocznych trójkątów, próg załamania {crease_deg:.0f}°)"
+    )
     return lines_3d
 
-# ---------------------
-# Optymalizacja ścieżki robota
-# ---------------------
-@measure_time
-def optimize_drawing_order(lines_3d, max_lines=2000):
-    """Optymalizuje kolejność rysowania używając algorytmu najbliższego sąsiada"""
-    if not lines_3d:
+
+def chain_segments(segments, atol=1e-5):
+    """Skleja odcinki stykające się wierzchołkiem w łamane."""
+    if not segments:
         return []
-    
-    # Ogranicz liczbę linii dla wydajności
-    if len(lines_3d) > max_lines:
-        print(f"Redukcja liczby linii z {len(lines_3d)} do {max_lines}")
-        # Wybierz równomiernie rozłożone linie
-        indices = np.linspace(0, len(lines_3d)-1, max_lines, dtype=int)
-        lines_3d = [lines_3d[i] for i in indices]
-    
-    # Konwertuj do pythonowych tuple dla stabilności porównań
-    lines_list = [(tuple(start), tuple(end)) for start, end in lines_3d]
-    
-    optimized = []
-    
-    # Rozpocznij od linii najbliżej początku układu
-    start_point = np.array([0.0, 0.0, 0.0])
-    
-    min_dist = float('inf')
-    best_idx = 0
-    for i, (s, e) in enumerate(lines_list):
-        dist = min(np.linalg.norm(np.array(s) - start_point), 
-                   np.linalg.norm(np.array(e) - start_point))
-        if dist < min_dist:
-            min_dist = dist
-            best_idx = i
-    
-    current_line = lines_list.pop(best_idx)
-    optimized.append((np.array(current_line[0]), np.array(current_line[1])))
-    current_end = np.array(current_line[1])
-    
-    # Optymalizuj kolejność
-    while lines_list and len(optimized) < max_lines:
-        min_dist = float('inf')
-        best_idx = 0
-        flip = False
-        
-        for i, (start_tuple, end_tuple) in enumerate(lines_list):
-            start_arr = np.array(start_tuple)
-            end_arr = np.array(end_tuple)
-            
-            # Odległość do początku linii
-            dist_start = np.linalg.norm(start_arr - current_end)
-            if dist_start < min_dist:
-                min_dist = dist_start
-                best_idx = i
-                flip = False
-            
-            # Odległość do końca linii (z odwróceniem)
-            dist_end = np.linalg.norm(end_arr - current_end)
-            if dist_end < min_dist:
-                min_dist = dist_end
-                best_idx = i
-                flip = True
-        
-        next_line_tuple = lines_list.pop(best_idx)
-        next_line_start = np.array(next_line_tuple[0])
-        next_line_end = np.array(next_line_tuple[1])
-        
-        if flip:
-            optimized.append((next_line_end, next_line_start))
-            current_end = next_line_start
+
+    def key(point):
+        return tuple(np.round(np.asarray(point, dtype=float) / atol).astype(np.int64))
+
+    unused = set(range(len(segments)))
+    buckets = {}
+    for index, (start, end) in enumerate(segments):
+        buckets.setdefault(key(start), []).append(index)
+        buckets.setdefault(key(end), []).append(index)
+
+    polylines = []
+    while unused:
+        index = unused.pop()
+        start, end = segments[index]
+        poly = [np.asarray(start, dtype=float), np.asarray(end, dtype=float)]
+        for forward in (True, False):
+            while True:
+                tip = poly[-1] if forward else poly[0]
+                previous = poly[-2] if forward and len(poly) > 1 else (poly[1] if not forward and len(poly) > 1 else tip)
+                direction = tip - previous
+                direction_norm = np.linalg.norm(direction)
+                best = None
+                best_alignment = -2.0
+                for candidate in buckets.get(key(tip), ()):
+                    if candidate not in unused:
+                        continue
+                    a, b = segments[candidate]
+                    a = np.asarray(a, dtype=float)
+                    b = np.asarray(b, dtype=float)
+                    if np.linalg.norm(a - tip) <= atol * 2:
+                        nxt = b
+                    elif np.linalg.norm(b - tip) <= atol * 2:
+                        nxt = a
+                    else:
+                        continue
+                    step = nxt - tip
+                    step_norm = np.linalg.norm(step)
+                    alignment = 0.0
+                    if direction_norm > 1e-12 and step_norm > 1e-12:
+                        alignment = float(np.dot(direction, step) / (direction_norm * step_norm))
+                    if alignment > best_alignment:
+                        best_alignment = alignment
+                        best = (candidate, nxt)
+                if best is None:
+                    break
+                unused.remove(best[0])
+                if forward:
+                    poly.append(best[1])
+                else:
+                    poly.insert(0, best[1])
+        polylines.append(np.vstack(poly))
+    print(f"Połączono odcinki w {len(polylines)} łamanych")
+    return polylines
+
+
+def simplify_polyline(points, epsilon):
+    """Ramer–Douglas–Peucker w 3D. Zostawia punkty dalej niż epsilon od cięciwy."""
+    points = np.asarray(points, dtype=float)
+    if len(points) < 3:
+        return points
+
+    keep = np.zeros(len(points), dtype=bool)
+    keep[0] = True
+    keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        start_i, end_i = stack.pop()
+        if end_i <= start_i + 1:
+            continue
+        segment = points[end_i] - points[start_i]
+        length = np.linalg.norm(segment)
+        chunk = points[start_i : end_i + 1]
+        if length < 1e-12:
+            distances = np.linalg.norm(chunk - points[start_i], axis=1)
         else:
-            optimized.append((next_line_start, next_line_end))
-            current_end = next_line_end
-    
-    print(f"Zoptymalizowano kolejność {len(optimized)} linii")
-    return optimized
+            distances = np.linalg.norm(np.cross(chunk - points[start_i], segment), axis=1) / length
+        offset = int(np.argmax(distances))
+        if distances[offset] > epsilon:
+            keep[start_i + offset] = True
+            stack.append((start_i, start_i + offset))
+            stack.append((start_i + offset, end_i))
+    return points[keep]
+
+
+def order_polylines(polylines):
+    """Najbliższy sąsiad po końcach łamanych, z odwróceniem kierunku."""
+    if len(polylines) < 2:
+        return polylines
+
+    remaining = [np.asarray(poly, dtype=float) for poly in polylines]
+    origin = np.zeros(3)
+    first = min(range(len(remaining)), key=lambda i: min(np.linalg.norm(remaining[i][0] - origin), np.linalg.norm(remaining[i][-1] - origin)))
+    current = remaining.pop(first)
+    if np.linalg.norm(current[0]) > np.linalg.norm(current[-1]):
+        current = current[::-1]
+    ordered = [current]
+
+    while remaining:
+        cursor = ordered[-1][-1]
+        best_index = 0
+        best_distance = float("inf")
+        reverse = False
+        for index, poly in enumerate(remaining):
+            dist_start = np.linalg.norm(poly[0] - cursor)
+            dist_end = np.linalg.norm(poly[-1] - cursor)
+            if dist_start < best_distance:
+                best_distance = dist_start
+                best_index = index
+                reverse = False
+            if dist_end < best_distance:
+                best_distance = dist_end
+                best_index = index
+                reverse = True
+        nxt = remaining.pop(best_index)
+        if reverse:
+            nxt = nxt[::-1]
+        ordered.append(nxt)
+    return ordered
+
+
+def polylines_to_segments(polylines):
+    segments = []
+    for poly in polylines:
+        for start, end in zip(poly, poly[1:]):
+            segments.append((start, end))
+    return segments
 
 # ---------------------
 # Renderowanie widoku 3D
@@ -584,32 +658,30 @@ def draw_robot_path_lines(img, lines_3d, view_dir, width, height):
 # Eksport ścieżek robota
 # ---------------------
 @measure_time
-def export_robot_data(lines_3d, output_dir, name="robot_path"):
-    """Eksportuje dane ścieżki robota w różnych formatach"""
+def export_robot_data(polylines, output_dir, name="robot_path"):
+    """Eksportuje łamane rysunku. Przerwa między niepołączonymi kreskami podnosi pisak."""
     os.makedirs(output_dir, exist_ok=True)
-    
-    if not lines_3d:
+
+    if not polylines:
         print("Brak linii do eksportu")
         return None
-    
-    print(f"Eksport {len(lines_3d)} linii...")
-    
-    # Zoptymalizuj kolejność (z limitem)
-    optimized_lines = optimize_drawing_order(lines_3d, max_lines=2000)
-    
-    # Eksport punktów
-    points = np.vstack([[s, e] for s, e in optimized_lines])
+
+    segments = polylines_to_segments(polylines)
+    print(f"Eksport {len(polylines)} łamanych ({len(segments)} odcinków)...")
+
+    points = np.vstack(polylines)
     points_file = os.path.join(output_dir, f"{name}_points.txt")
     np.savetxt(points_file, points, fmt="%.6f")
-    
-    # Eksport linii
+
     lines_file = os.path.join(output_dir, f"{name}_lines.txt")
-    with open(lines_file, 'w') as f:
-        for s, e in optimized_lines:
-            f.write(f"{s[0]:.6f} {s[1]:.6f} {s[2]:.6f} {e[0]:.6f} {e[1]:.6f} {e[2]:.6f}\n")
-    
-    # Eksport komend Hanwha HCR-3A
-    commands_file = export_hanwha_commands(optimized_lines, output_dir, name)
+    with open(lines_file, "w") as handle:
+        for start, end in segments:
+            handle.write(
+                f"{start[0]:.6f} {start[1]:.6f} {start[2]:.6f} "
+                f"{end[0]:.6f} {end[1]:.6f} {end[2]:.6f}\n"
+            )
+
+    commands_file = export_hanwha_commands(polylines, output_dir, name)
     
     print(f"Dane robota zapisane:")
     print(f"  - Punkty: {points_file}")
@@ -619,41 +691,31 @@ def export_robot_data(lines_3d, output_dir, name="robot_path"):
     return points_file
 
 @measure_time
-def export_hanwha_commands(lines_3d, output_dir, name):
-    """Generuje komendy dla robota Hanwha HCR-3A"""
+def export_hanwha_commands(polylines, output_dir, name):
+    """Generuje komendy dla robota Hanwha HCR-3A. MOVE_LIFT tylko przy prawdziwej przerwie."""
     commands_file = os.path.join(output_dir, f"{name}_hanwha_commands.txt")
     stats_file = os.path.join(output_dir, f"{name}_stats.json")
-    
-    with open(commands_file, 'w') as f:
-        f.write("# Komendy robota Hanwha HCR-3A\n")
-        f.write(f"# Wygenerowano: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"# Liczba linii: {len(lines_3d)}\n\n")
-        
-        # Inicjalizacja
-        f.write("INIT\n")
-        f.write(f"SET_SPEED DRAW={Config.DRAWING_SPEED} TRAVEL={Config.TRAVEL_SPEED}\n")
-        f.write(f"SET_Z_LIFT {Config.Z_LIFT}\n\n")
-        
-        # Przejdź do pozycji startowej
-        first_start = lines_3d[0][0]
-        f.write("# Przejdź do pozycji startowej\n")
-        f.write(f"MOVE_LIFT {first_start[0]*1000:.3f} {first_start[1]*1000:.3f} {first_start[2]*1000:.3f}\n\n")
-        
-        # Rysuj linie
-        f.write("# Rozpocznij rysowanie\n")
-        f.write("START_DRAWING\n")
-        
-        for i, (start, end) in enumerate(lines_3d, 1):
-            f.write(f"# Linia {i}\n")
-            f.write(f"LINE {end[0]*1000:.3f} {end[1]*1000:.3f} {end[2]*1000:.3f}\n")
-        
-        # Zakończ
-        f.write("\n# Zakończ rysowanie\n")
-        f.write("STOP_DRAWING\n")
-        f.write("RETURN_HOME\n")
-    
-    # Oblicz statystyki
-    stats = calculate_path_statistics(lines_3d)
+    lift_gap = Config.VOXEL_SIZE * 0.25
+    commands = drawing_commands(polylines, lift_gap)
+
+    with open(commands_file, "w") as handle:
+        handle.write("# Komendy robota Hanwha HCR-3A\n")
+        handle.write(f"# Wygenerowano: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        handle.write(f"# Liczba łamanych: {len(polylines)}\n\n")
+        handle.write("INIT\n")
+        handle.write(f"SET_SPEED DRAW={Config.DRAWING_SPEED} TRAVEL={Config.TRAVEL_SPEED}\n")
+        handle.write(f"SET_Z_LIFT {Config.Z_LIFT}\n\n")
+        handle.write("START_DRAWING\n")
+        for kind, point in commands:
+            coords = f"{point[0]*1000:.3f} {point[1]*1000:.3f} {point[2]*1000:.3f}"
+            if kind == "lift":
+                handle.write(f"MOVE_LIFT {coords}\n")
+            else:
+                handle.write(f"LINE {coords}\n")
+        handle.write("\nSTOP_DRAWING\n")
+        handle.write("RETURN_HOME\n")
+
+    stats = calculate_path_statistics(polylines, lift_gap)
     with open(stats_file, 'w') as f:
         json.dump(stats, f, indent=2)
     
@@ -664,29 +726,55 @@ def export_hanwha_commands(lines_3d, output_dir, name):
     
     return commands_file
 
-def calculate_path_statistics(lines_3d):
-    """Oblicza statystyki ścieżki"""
-    drawing_length = sum(np.linalg.norm(end - start) * 1000 for start, end in lines_3d)
-    
-    travel_length = 0
-    for i in range(1, len(lines_3d)):
-        prev_end = lines_3d[i-1][1]
-        curr_start = lines_3d[i][0]
-        travel_length += np.linalg.norm(curr_start - prev_end) * 1000
-    
+def drawing_commands(polylines, lift_gap):
+    """Punkty łamanej to LINE. MOVE_LIFT tylko przy starcie nowej, niepołączonej kreski."""
+    commands = []
+    pen = None
+    for poly in polylines:
+        points = np.asarray(poly, dtype=float)
+        if len(points) == 0:
+            continue
+        if pen is None or np.linalg.norm(points[0] - pen) > lift_gap:
+            commands.append(("lift", points[0]))
+        pen = points[0]
+        for point in points[1:]:
+            if np.linalg.norm(point - pen) > 1e-6:
+                commands.append(("line", point))
+            pen = point
+    return commands
+
+
+def calculate_path_statistics(polylines, lift_gap):
+    """Długość rysowania i przejazdów w milimetrach."""
+    drawing_length = 0.0
+    travel_length = 0.0
+    pen = None
+    segments = 0
+    for poly in polylines:
+        points = np.asarray(poly, dtype=float)
+        if len(points) == 0:
+            continue
+        if pen is not None:
+            gap = np.linalg.norm(points[0] - pen) * 1000
+            if gap > lift_gap * 1000:
+                travel_length += gap
+        for start, end in zip(points, points[1:]):
+            drawing_length += np.linalg.norm(end - start) * 1000
+            segments += 1
+        pen = points[-1]
+
     drawing_time = drawing_length / Config.DRAWING_SPEED
     travel_time = travel_length / Config.TRAVEL_SPEED
-    total_time = drawing_time + travel_time
-    
     return {
-        "total_lines": len(lines_3d),
+        "total_polylines": len(polylines),
+        "total_lines": segments,
         "total_drawing_length": drawing_length,
         "total_travel_length": travel_length,
         "estimated_drawing_time": drawing_time,
         "estimated_travel_time": travel_time,
-        "estimated_total_time": total_time,
+        "estimated_total_time": drawing_time + travel_time,
         "drawing_speed": Config.DRAWING_SPEED,
-        "travel_speed": Config.TRAVEL_SPEED
+        "travel_speed": Config.TRAVEL_SPEED,
     }
 
 # ---------------------
@@ -745,10 +833,20 @@ def main(point_cloud_path, camera_position=None, look_at_point=None):
     print(f"Kamera: {camera_position}")
     print(f"Cel: {look_at_point}")
     
-    # Generuj linie 3D
-    lines_3d = generate_simplified_lines_from_mesh(mesh, camera_position, 
-                                                  threshold=Config.VISIBILITY_THRESHOLD)
-    
+    segments = extract_feature_edges(
+        mesh,
+        camera_position,
+        threshold=Config.VISIBILITY_THRESHOLD,
+        crease_deg=Config.CREASE_ANGLE_DEG,
+    )
+    polylines = chain_segments(segments)
+    epsilon = Config.VOXEL_SIZE * Config.EDGE_SIMPLIFY_VOXELS
+    polylines = [simplify_polyline(poly, epsilon) for poly in polylines]
+    polylines = [poly for poly in polylines if len(poly) >= 2]
+    polylines = order_polylines(polylines)
+    lines_3d = polylines_to_segments(polylines)
+    print(f"Ścieżka rysunku: {len(polylines)} łamanych, {len(lines_3d)} odcinków")
+
     # Renderuj widok
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
     render_output = os.path.join(Config.OUTPUT_DIR, "mesh_render.png")
@@ -756,7 +854,7 @@ def main(point_cloud_path, camera_position=None, look_at_point=None):
                     Config.IMAGE_WIDTH, Config.IMAGE_HEIGHT, lines_3d)
     
     # Eksport danych robota
-    export_robot_data(lines_3d, Config.OUTPUT_DIR)
+    export_robot_data(polylines, Config.OUTPUT_DIR)
     
     # Zapisz mesh
     mesh_output = os.path.join(Config.OUTPUT_DIR, "reconstructed_mesh.ply")
