@@ -4,924 +4,1109 @@ import cv2
 import sys
 import open3d as o3d
 import time
-from functools import wraps, lru_cache
+from functools import wraps
 import os
-from scipy.spatial import cKDTree
 import json
+import argparse
+from collections import Counter, defaultdict
+import svgwrite
+import xml.etree.ElementTree as ET
+import math
+from multiprocessing.dummy import Pool as ThreadPool
+
+# Opcjonalne: Numba dla przyspieszenia
+try:
+    from numba import jit, prange, njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    def jit(*args, **kwargs):
+        return lambda func: func
+    prange = range
 
 # ---------------------
 # Konfiguracja
 # ---------------------
 class Config:
     OUTPUT_DIR = "./output"
-    VOXEL_SIZE = 0.02
-    POISSON_DEPTH = 10
-    SMOOTH_ITERATIONS = 1
-    # Krawędź zostaje, gdy sąsiednie ściany łamią się o co najmniej tyle stopni.
-    CREASE_ANGLE_DEG = 35.0
-    # Uproszczenie brzegu: punkt odpada, gdy leży bliżej cięciwy niż tyle wokseli.
-    EDGE_SIMPLIFY_VOXELS = 0.5
     VISIBILITY_THRESHOLD = 0.1
     IMAGE_WIDTH = 1920
     IMAGE_HEIGHT = 1080
-    DRAWING_SPEED = 50  # mm/s
-    TRAVEL_SPEED = 100  # mm/s
-    Z_LIFT = 5  # mm
+    DRAWING_SPEED = 100
+    TRAVEL_SPEED = 150
+    MAX_TRIANGLES = 200
+    MAX_TRIANGLES_OUTLINE = 5000  # Więcej trójkątów dla outline dla lepszej ciągłości
+    PAPER_FORMAT = "A4"
+    ROBOT_WORKSPACE_Z = 100.0
+    ROBOT_SAFE_Z = 50.0
+    PAPER_SIZES = {"A4": (210.0, 297.0), "A5": (148.0, 210.0), "A3": (297.0, 420.0)}
+    PAPER_MARGIN = 10.0
+    PAPER_LANDSCAPE = False
+    
+    # Nowe parametry progowe
+    MIN_SEGMENT_LENGTH = 0.8   # mm - minimalna długość segmentu, krótsze usuwamy
+    MIN_CHAIN_LENGTH = 4.0     # mm - minimalna długość całego łańcucha (sumarycznie)
+    MIN_SEGMENTS_IN_CHAIN = 2  # minimalna liczba segmentów w łańcuchu
+    CREASE_ANGLE_DEG = 35.0    # ostre załamanie ścian, które też idzie do rysunku
 
-# ---------------------
-# Dekorator mierzący czas
-# ---------------------
+# Threshold dla wielkich siatek (liczba trójkątów)
+LARGE_MESH_TRI = 1_000_000
+
 def measure_time(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         start = time.time()
         result = func(*args, **kwargs)
-        elapsed = time.time() - start
-        print(f"[BENCH] {func.__name__}: {elapsed:.4f}s")
+        print(f"[BENCH] {func.__name__}: {time.time() - start:.4f}s")
         return result
     return wrapper
 
 # ---------------------
-# Loader chmur punktów
+# Funkcje Numba
 # ---------------------
-@lru_cache(maxsize=8)
-@measure_time
-def load_point_cloud(path):
-    """Wczytuje chmurę punktów z różnych formatów"""
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Plik nie istnieje: {path}")
-    
-    ext = os.path.splitext(path)[1].lower()
-    print(f"Wczytywanie {path} (format: {ext})")
-    
-    try:
-        if ext in (".las", ".laz"):
-            return load_las_file(path)
-        elif ext in [".ply", ".pcd", ".xyz", ".obj", ".off", ".stl"]:
-            return load_3d_file(path)
-        elif ext in [".csv", ".txt"]:
-            return load_text_file(path)
-        else:
-            raise ValueError(f"Nieobsługiwany format pliku: {ext}")
-    except Exception as e:
-        print(f"Błąd wczytywania {path}: {e}")
-        raise
+if NUMBA_AVAILABLE:
+    @njit(cache=True, fastmath=True)
+    def compute_backface_culling_numba(centers, normals, camera_pos, threshold):
+        """Numba-accelerated backface culling (szybciej)."""
+        n = centers.shape[0]
+        out = np.zeros(n, dtype=np.bool_)
+        cx = camera_pos[0]; cy = camera_pos[1]; cz = camera_pos[2]
+        for i in range(n):
+            dx = cx - centers[i, 0]
+            dy = cy - centers[i, 1]
+            dz = cz - centers[i, 2]
+            dot = normals[i, 0] * dx + normals[i, 1] * dy + normals[i, 2] * dz
+            out[i] = dot > threshold
+        return out
 
-def load_las_file(path):
-    """Wczytuje plik LAS/LAZ"""
-    import laspy
-    las = laspy.open(path, mode='r')
-    points = las.read()
-    xyz = np.vstack((points.x, points.y, points.z)).T.astype(np.float32)
-    
-    # Normalizacja współrzędnych jeśli są zbyt duże
-    if np.max(np.abs(xyz)) > 1000:
-        print("Normalizacja współrzędnych LAS...")
-        xyz = xyz - np.mean(xyz, axis=0)
-    
-    # Intensywność lub kolory
-    if hasattr(points, "intensity"):
-        intensity = np.asarray(points.intensity, dtype=np.float32)
-        intensity = (intensity - np.min(intensity)) / (np.max(intensity) - np.min(intensity))
-    else:
-        intensity = np.ones(len(xyz), dtype=np.float32)
-    
-    return np.hstack([xyz, intensity[:, None]])
-
-def load_3d_file(path):
-    """Wczytuje pliki 3D (PLY, PCD, OBJ, etc.)"""
-    ext = os.path.splitext(path)[1].lower()
-    
-    if ext == ".stl":
-        mesh = o3d.io.read_triangle_mesh(path)
-        pcd = mesh.sample_points_poisson_disk(100000)
-    else:
-        pcd = o3d.io.read_point_cloud(path)
-    
-    if not pcd.has_points() or len(pcd.points) == 0:
-        raise ValueError("Plik nie zawiera punktów")
-    
-    points = np.asarray(pcd.points, dtype=np.float32)
-    
-    # Normalizacja jeśli współrzędne są zbyt duże
-    if np.max(np.abs(points)) > 1000:
-        print("Normalizacja współrzędnych 3D...")
-        points = points - np.mean(points, axis=0)
-    
-    # Dodanie intensywności z kolorów lub stałej wartości
-    if pcd.has_colors():
-        colors = np.asarray(pcd.colors, dtype=np.float32)
-        intensity = colors.mean(axis=1, keepdims=True)
-    else:
-        intensity = np.ones((len(points), 1), dtype=np.float32)
-    
-    return np.hstack([points, intensity])
-
-def load_text_file(path):
-    """Wczytuje pliki tekstowe (CSV, TXT)"""
-    data = np.loadtxt(path, delimiter=None, dtype=np.float32)
-    
-    if data.ndim != 2:
-        raise ValueError("Nieprawidłowy format danych")
-    
-    # Automatyczne wykrywanie kolumn
-    if data.shape[1] >= 3:
-        points = data[:, :3]
-        if data.shape[1] >= 4:
-            intensity = data[:, 3:4]
-        else:
-            intensity = np.ones((len(points), 1), dtype=np.float32)
-    else:
-        raise ValueError("Plik musi zawierać co najmniej 3 kolumny (X,Y,Z)")
-    
-    return np.hstack([points, intensity])
+    @jit(nopython=True, cache=True)
+    def find_nearest_numba(current_end, starts, ends, used_mask):
+        best_idx, best_dist, flip = -1, np.inf, False
+        for i in prange(len(starts)):
+            if used_mask[i]:
+                continue
+            d = current_end - starts[i]
+            dist_start = np.sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2])
+            if dist_start < best_dist:
+                best_dist, best_idx, flip = dist_start, i, False
+            d = current_end - ends[i]
+            dist_end = np.sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2])
+            if dist_end < best_dist:
+                best_dist, best_idx, flip = dist_end, i, True
+        return best_idx, flip
 
 # ---------------------
-# Przetwarzanie wstępne chmury punktów
+# Pomocnicze funkcje (zastąpione szybszymi implementacjami)
 # ---------------------
-@measure_time
-def preprocess_point_cloud(points, voxel_size=0.02):
-    """Czyszczenie i downsampling chmury punktów"""
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points[:, :3])
-    
-    # Usuwanie outlierów statystycznych
-    pcd, inliers = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    print(f"Usunięto {len(points) - len(inliers)} outlierów")
-    
-    # Downsampling
-    if voxel_size > 0:
-        pcd = pcd.voxel_down_sample(voxel_size)
-        print(f"Po downsamplingu: {len(pcd.points)} punktów")
-    
-    return np.asarray(pcd.points, dtype=np.float32)
+def backface_culling(centers, normals, camera_pos, threshold):
+    """Backface culling - Numba lub NumPy"""
+    if NUMBA_AVAILABLE:
+        return compute_backface_culling_numba(centers, normals, camera_pos.astype(np.float32), threshold)
+    view_dirs = camera_pos - centers
+    norms = np.linalg.norm(view_dirs, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    return np.einsum('ij,ij->i', normals, view_dirs / norms) > threshold
 
-# ---------------------
-# Budowa meshu
-# ---------------------
-@measure_time
-def build_mesh(points, method="poisson", depth=10, simplify=True):
-    """Buduje siatkę trójkątną z chmury punktów"""
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+def get_projection_axes(view_dir):
+    """Zwraca indeksy osi dla projekcji 2D"""
+    if abs(view_dir[2]) > 0.7:
+        return [0, 1]
+    elif abs(view_dir[1]) > 0.7:
+        return [0, 2]
+    return [1, 2]
+
+
+def _lines_to_graph(lines, quant=4):
+    """Konwertuje listę linii (s,e) -> macierz wierzchołków i lista krawędzi (indeksy)"""
+    coord_to_idx = {}
+    vertices = []
+    edges = []
+    for s, e in lines:
+        ks = tuple(np.round(s, quant).tolist())
+        ke = tuple(np.round(e, quant).tolist())
+        if ks not in coord_to_idx:
+            coord_to_idx[ks] = len(vertices); vertices.append(np.array(ks, dtype=np.float64))
+        if ke not in coord_to_idx:
+            coord_to_idx[ke] = len(vertices); vertices.append(np.array(ke, dtype=np.float64))
+        edges.append((coord_to_idx[ks], coord_to_idx[ke]))
+    return np.array(vertices, dtype=np.float64), edges
+
+def _edge_length(vertices, edge):
+    a, b = edge
+    return float(np.linalg.norm(vertices[a] - vertices[b]))
+
+def _prune_short_dangles(vertices, edges, min_len, max_iter=10):
+    """
+    Iteracyjnie usuwa krawędzie wiszące (degree==1) krótsze niż min_len.
+    Zwraca listę pozostałych krawędzi jako tuple(index,index).
+    """
+    adj = defaultdict(list)
+    for a,b in edges:
+        adj[a].append(b); adj[b].append(a)
+    edge_set = set(tuple(sorted(e)) for e in edges)
+    for _ in range(max_iter):
+        to_remove = []
+        degrees = {v: len(nei) for v, nei in adj.items()}
+        for e in list(edge_set):
+            a,b = e
+            if degrees.get(a,0) == 1 or degrees.get(b,0) == 1:
+                if _edge_length(vertices, e) < min_len:
+                    to_remove.append(e)
+        if not to_remove:
+            break
+        for e in to_remove:
+            a,b = e
+            edge_set.discard(e)
+            if b in adj[a]: adj[a].remove(b)
+            if a in adj[b]: adj[b].remove(a)
+    return [tuple(e) for e in edge_set]
+
+def chain_segments(edges, vertices):
+    """Łączy krawędzie w ciągłe łańcuchy - ulepszona wersja dla lepszej ciągłości"""
+    if not edges:
+        return []
     
-    # Estymacja normalnych
-    print("Estymacja normalnych...")
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-    pcd.orient_normals_consistent_tangent_plane(30)
+    # Buduj graf sąsiedztwa
+    adj = defaultdict(list)
+    for v1, v2 in edges:
+        adj[v1].append(v2)
+        adj[v2].append(v1)
     
-    if method == "ball_pivoting":
-        # Ball Pivoting
-        radii = [0.005, 0.01, 0.02, 0.04]
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-            pcd, o3d.utility.DoubleVector(radii))
-    else:
-        # Poisson Reconstruction
-        print("Rekonstrukcja Poisson...")
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=depth, linear_fit=True)
+    chains = []
+    visited_edges = set()
+    
+    # Znajdź wierzchołki o nieparzystym stopniu (końce łańcuchów)
+    odd_vertices = [v for v, neighbors in adj.items() if len(neighbors) % 2 == 1]
+    
+    # Jeśli nie ma wierzchołków o nieparzystym stopniu, wybierz dowolny
+    start_vertices = odd_vertices if odd_vertices else list(adj.keys())
+    
+    for start in start_vertices[:]:
+        if start not in adj or not adj[start]:
+            continue
+            
+        # Użyj DFS dla lepszej ciągłości
+        stack = [start]
+        chain = []
         
-        # Usuwanie wierzchołków o niskiej gęstości
-        if len(densities) > 0:
-            densities = np.asarray(densities)
-            density_threshold = np.quantile(densities, 0.05)
-            vertices_to_keep = densities > density_threshold
-            mesh = mesh.select_by_index(np.where(vertices_to_keep)[0])
+        while stack:
+            curr = stack[-1]
+            if adj[curr]:
+                next_node = adj[curr].pop()
+                if next_node in adj and curr in adj[next_node]:
+                    adj[next_node].remove(curr)
+                
+                edge_key = tuple(sorted([curr, next_node]))
+                if edge_key not in visited_edges:
+                    visited_edges.add(edge_key)
+                    stack.append(next_node)
+            else:
+                chain.append(stack.pop())
+        
+        if len(chain) > 1:
+            # Konwertuj indeksy wierzchołków na współrzędne
+            coord_chain = [vertices[i] for i in chain]
+            chains.append(coord_chain)
     
-    # Jedno przejście Taubina zamiast kilku Laplace'a: mniej kurczy powierzchnię.
-    print("Wygładzanie meshu...")
-    mesh = mesh.filter_smooth_taubin(number_of_iterations=Config.SMOOTH_ITERATIONS)
+    # Dodaj pozostałe cykle
+    remaining_vertices = [v for v in adj if adj[v]]
+    while remaining_vertices:
+        start = remaining_vertices[0]
+        stack = [start]
+        chain = []
+        
+        while stack:
+            curr = stack[-1]
+            if adj[curr]:
+                next_node = adj[curr].pop()
+                if next_node in adj and curr in adj[next_node]:
+                    adj[next_node].remove(curr)
+                
+                edge_key = tuple(sorted([curr, next_node]))
+                if edge_key not in visited_edges:
+                    visited_edges.add(edge_key)
+                    stack.append(next_node)
+            else:
+                chain.append(stack.pop())
+        
+        if len(chain) > 1:
+            coord_chain = [vertices[i] for i in chain]
+            chains.append(coord_chain)
+        
+        remaining_vertices = [v for v in adj if adj[v]]
+    
+    return chains
 
-    # Zwijaj tylko trójkąty, których błąd jest mniejszy niż woksel.
-    # Brzeg ma dużą wagę, żeby kontur nie uciekł od chmury punktów.
-    if simplify and len(mesh.triangles) > 1:
-        before = len(mesh.triangles)
-        mesh = mesh.simplify_quadric_decimation(
-            target_number_of_triangles=1,
-            maximum_error=float(Config.VOXEL_SIZE ** 2),
-            boundary_weight=10.0,
-        )
-        print(f"Uproszczenie siatki w budżecie błędu: {before} -> {len(mesh.triangles)} trójkątów")
-    
-    # Oblicz normalne
-    mesh.compute_vertex_normals()
-    mesh.compute_triangle_normals()
-    
-    print(f"Utworzono mesh: {len(mesh.vertices)} wierzchołków, {len(mesh.triangles)} trójkątów")
-    return mesh
-
-# ---------------------
-# Generowanie linii 3D z meshu
-# ---------------------
-@measure_time
-def extract_feature_edges(mesh, camera_position, threshold=0.1, crease_deg=35.0):
-    """Brzeg widocznej powierzchni i ostre załamania. Płaskie krawędzie wewnętrzne odpadają."""
-    if len(mesh.triangles) == 0:
-        print("Mesh nie zawiera trójkątów")
+def _filter_short_chains(vertices, edges, min_chain_len, min_segments):
+    """
+    Buduje łańcuchy (chain_segments) i odrzuca te krótsze niż min_chain_len
+    lub z mniejszą liczbą segmentów niż min_segments. Zwraca listę linii.
+    """
+    if not edges:
         return []
-
-    vertices = np.asarray(mesh.vertices)
-    triangles = np.asarray(mesh.triangles)
-
-    if len(mesh.triangle_normals) == 0:
-        mesh.compute_triangle_normals()
-    normals = np.asarray(mesh.triangle_normals)
-
-    centers = np.mean(vertices[triangles], axis=1)
-    view_dirs = camera_position - centers
-    view_dirs /= np.linalg.norm(view_dirs, axis=1, keepdims=True)
-    visible = np.einsum("ij,ij->i", normals, view_dirs) > threshold
-    visible_triangles = triangles[visible]
-    visible_normals = normals[visible]
-
-    if len(visible_triangles) == 0:
-        print("Brak widocznych trójkątów")
-        return []
-
-    edge_faces = {}
-    for face_index, tri in enumerate(visible_triangles):
-        corners = (int(tri[0]), int(tri[1]), int(tri[2]))
-        for a, b in ((corners[0], corners[1]), (corners[1], corners[2]), (corners[2], corners[0])):
-            edge_faces.setdefault((a, b) if a < b else (b, a), []).append(face_index)
-
-    crease = np.deg2rad(crease_deg)
-    kept = []
-    for (i, j), faces in edge_faces.items():
-        if len(faces) == 1:
-            kept.append((i, j))
+    chains = chain_segments(edges, vertices)
+    out_lines = []
+    for chain in chains:
+        segs = len(chain) - 1
+        if segs < min_segments:
             continue
-        n0 = visible_normals[faces[0]]
-        n1 = visible_normals[faces[1]]
-        angle = np.arccos(np.clip(np.dot(n0, n1), -1.0, 1.0))
-        if angle >= crease:
-            kept.append((i, j))
+        total = 0.0
+        for i in range(segs):
+            total += np.linalg.norm(chain[i+1] - chain[i])
+        if total >= min_chain_len:
+            for i in range(segs):
+                out_lines.append((chain[i].copy(), chain[i+1].copy()))
+    return out_lines
 
-    lines_3d = [(vertices[i], vertices[j]) for i, j in kept]
-    print(
-        f"Krawędzie rysunku: {len(lines_3d)} z {len(edge_faces)} "
-        f"({len(visible_triangles)} widocznych trójkątów, próg załamania {crease_deg:.0f}°)"
-    )
-    return lines_3d
-
-
-def chain_segments(segments, atol=1e-5):
-    """Skleja odcinki stykające się wierzchołkiem w łamane."""
-    if not segments:
+def remove_artifacts(lines, min_seg_len=None, min_chain_len=None, min_segments=None):
+    """
+    Usuwa krótkie pojedyncze segmenty oraz krótkie łańcuchy.
+    Zwraca przefiltrowaną listę linii.
+    """
+    if not lines:
         return []
+    if min_seg_len is None:
+        min_seg_len = Config.MIN_SEGMENT_LENGTH
+    if min_chain_len is None:
+        min_chain_len = Config.MIN_CHAIN_LENGTH
+    if min_segments is None:
+        min_segments = Config.MIN_SEGMENTS_IN_CHAIN
 
-    def key(point):
-        return tuple(np.round(np.asarray(point, dtype=float) / atol).astype(np.int64))
+    vertices, edges = _lines_to_graph(lines, quant=4)
+    # Usuń wiszące krótkie odcinki
+    pruned = _prune_short_dangles(vertices, edges, min_seg_len)
+    # Filtruj krótkie łańcuchy
+    clean = _filter_short_chains(vertices, pruned, min_chain_len, min_segments)
+    if clean:
+        return clean
+    # Fallback: usuń tylko krótkie pojedyncze segmenty
+    return [ln for ln in lines if np.linalg.norm(ln[1] - ln[0]) >= min_seg_len]
 
-    unused = set(range(len(segments)))
-    buckets = {}
-    for index, (start, end) in enumerate(segments):
-        buckets.setdefault(key(start), []).append(index)
-        buckets.setdefault(key(end), []).append(index)
+def optimize_chain_order(chains):
+    """Lekka heurystyka minimalizująca przeskoki między łańcuchami."""
+    if not chains or len(chains) <= 1:
+        return chains
 
-    polylines = []
-    while unused:
-        index = unused.pop()
-        start, end = segments[index]
-        poly = [np.asarray(start, dtype=float), np.asarray(end, dtype=float)]
-        for forward in (True, False):
-            while True:
-                tip = poly[-1] if forward else poly[0]
-                previous = poly[-2] if forward and len(poly) > 1 else (poly[1] if not forward and len(poly) > 1 else tip)
-                direction = tip - previous
-                direction_norm = np.linalg.norm(direction)
-                best = None
-                best_alignment = -2.0
-                for candidate in buckets.get(key(tip), ()):
-                    if candidate not in unused:
-                        continue
-                    a, b = segments[candidate]
-                    a = np.asarray(a, dtype=float)
-                    b = np.asarray(b, dtype=float)
-                    if np.linalg.norm(a - tip) <= atol * 2:
-                        nxt = b
-                    elif np.linalg.norm(b - tip) <= atol * 2:
-                        nxt = a
-                    else:
-                        continue
-                    step = nxt - tip
-                    step_norm = np.linalg.norm(step)
-                    alignment = 0.0
-                    if direction_norm > 1e-12 and step_norm > 1e-12:
-                        alignment = float(np.dot(direction, step) / (direction_norm * step_norm))
-                    if alignment > best_alignment:
-                        best_alignment = alignment
-                        best = (candidate, nxt)
-                if best is None:
-                    break
-                unused.remove(best[0])
-                if forward:
-                    poly.append(best[1])
-                else:
-                    poly.insert(0, best[1])
-        polylines.append(np.vstack(poly))
-    print(f"Połączono odcinki w {len(polylines)} łamanych")
-    return polylines
+    ordered = [chains.pop(0)]
 
-
-def simplify_polyline(points, epsilon):
-    """Ramer–Douglas–Peucker w 3D. Zostawia punkty dalej niż epsilon od cięciwy."""
-    points = np.asarray(points, dtype=float)
-    if len(points) < 3:
-        return points
-
-    keep = np.zeros(len(points), dtype=bool)
-    keep[0] = True
-    keep[-1] = True
-    stack = [(0, len(points) - 1)]
-    while stack:
-        start_i, end_i = stack.pop()
-        if end_i <= start_i + 1:
-            continue
-        segment = points[end_i] - points[start_i]
-        length = np.linalg.norm(segment)
-        chunk = points[start_i : end_i + 1]
-        if length < 1e-12:
-            distances = np.linalg.norm(chunk - points[start_i], axis=1)
-        else:
-            distances = np.linalg.norm(np.cross(chunk - points[start_i], segment), axis=1) / length
-        offset = int(np.argmax(distances))
-        if distances[offset] > epsilon:
-            keep[start_i + offset] = True
-            stack.append((start_i, start_i + offset))
-            stack.append((start_i + offset, end_i))
-    return points[keep]
-
-
-def order_polylines(polylines):
-    """Najbliższy sąsiad po końcach łamanych, z odwróceniem kierunku."""
-    if len(polylines) < 2:
-        return polylines
-
-    remaining = [np.asarray(poly, dtype=float) for poly in polylines]
-    origin = np.zeros(3)
-    first = min(range(len(remaining)), key=lambda i: min(np.linalg.norm(remaining[i][0] - origin), np.linalg.norm(remaining[i][-1] - origin)))
-    current = remaining.pop(first)
-    if np.linalg.norm(current[0]) > np.linalg.norm(current[-1]):
-        current = current[::-1]
-    ordered = [current]
-
-    while remaining:
-        cursor = ordered[-1][-1]
-        best_index = 0
-        best_distance = float("inf")
+    while chains:
+        last_pt = np.asarray(ordered[-1][-1])
+        best_i = None
+        best_d = 1e20
         reverse = False
-        for index, poly in enumerate(remaining):
-            dist_start = np.linalg.norm(poly[0] - cursor)
-            dist_end = np.linalg.norm(poly[-1] - cursor)
-            if dist_start < best_distance:
-                best_distance = dist_start
-                best_index = index
+
+        for i, c in enumerate(chains):
+            c0 = np.asarray(c[0])
+            c1 = np.asarray(c[-1])
+            d0 = np.linalg.norm(last_pt - c0)
+            d1 = np.linalg.norm(last_pt - c1)
+
+            if d0 < best_d:
+                best_d = d0
+                best_i = i
                 reverse = False
-            if dist_end < best_distance:
-                best_distance = dist_end
-                best_index = index
+            if d1 < best_d:
+                best_d = d1
+                best_i = i
                 reverse = True
-        nxt = remaining.pop(best_index)
+
+        chain = chains.pop(best_i)
         if reverse:
-            nxt = nxt[::-1]
-        ordered.append(nxt)
+            chain = chain[::-1]
+        ordered.append(chain)
+
     return ordered
 
-
-def polylines_to_segments(polylines):
-    segments = []
-    for poly in polylines:
-        for start, end in zip(poly, poly[1:]):
-            segments.append((start, end))
-    return segments
-
 # ---------------------
-# Renderowanie widoku 3D
+# Generowanie linii - ULEPSZONE (szybsza wersja)
 # ---------------------
 @measure_time
-def render_mesh_view(mesh, camera_position, look_at_point, output_path, 
-                    width=1920, height=1080, lines_3d=None):
-    """Renderuje widok meshu z danej perspektywy kamery"""
-    try:
-        # Sprawdź czy Open3D może renderować w środowisku
-        os.environ['OPEN3D_CPU_RENDERING'] = 'true'
-        
-        # Utwórz wizualizator
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(width=width, height=height, visible=False)
-        
-        # Dodaj mesh
-        mesh_copy = o3d.geometry.TriangleMesh(mesh)
-        mesh_copy.compute_vertex_normals()
-        vis.add_geometry(mesh_copy)
-        
-        # Dodaj linie jeśli dostępne
-        if lines_3d:
-            line_set = create_line_set(lines_3d[:min(len(lines_3d), 5000)])  # Limit dla wydajności
-            vis.add_geometry(line_set)
-        
-        # Konfiguracja kamery
-        ctr = vis.get_view_control()
-        
-        if ctr is None:
-            raise RuntimeError("View control nie został zainicjalizowany")
-        
-        # Renderuj aby zainicjalizować view control
-        vis.poll_events()
-        vis.update_renderer()
-        
-        # Oblicz kierunki kamery
-        forward = look_at_point - camera_position
-        forward = forward / np.linalg.norm(forward)
-        up = np.array([0.0, 0.0, 1.0])
-        
-        if abs(np.dot(forward, up)) > 0.9:
-            up = np.array([0.0, 1.0, 0.0])
-        
-        # Ustaw kamerę
-        ctr.set_lookat(look_at_point)
-        ctr.set_front(forward)
-        ctr.set_up(up)
-        
-        # Renderuj i zapisz obraz
-        vis.poll_events()
-        vis.update_renderer()
-        
-        image = vis.capture_screen_float_buffer(do_render=True)
-        image_array = (np.asarray(image) * 255).astype(np.uint8)
-        
-        if image_array.size == 0:
-            raise RuntimeError("Przechwycenie bufora ekranu nie powiodło się")
-        
-        # Konwertuj BGR dla OpenCV
-        image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(output_path, image_bgr)
-        
-        vis.destroy_window()
-        print(f"Render 3D zapisany: {output_path}")
-        return output_path
-        
-    except Exception as e:
-        print(f"Błąd renderowania 3D: {e}")
-        print("Przełączanie na rendering wireframe 2D...")
-        return create_wireframe_render(mesh, camera_position, look_at_point, output_path, 
-                                      width, height, lines_3d)
 
-def calculate_camera_matrix(camera_pos, look_at):
-    """Oblicza macierz kamery dla Open3D"""
-    forward = look_at - camera_pos
-    forward = forward / np.linalg.norm(forward)
-    
-    # Oblicz prawy i górny wektor
-    if abs(forward[2]) > 0.9:
-        right = np.array([1, 0, 0])
-    else:
-        right = np.cross(forward, np.array([0, 0, 1]))
-        right = right / np.linalg.norm(right)
-    
-    up = np.cross(right, forward)
-    
-    # Macierz ekstrinsyczna
-    rotation = np.column_stack([right, up, -forward])
-    translation = -rotation.T @ camera_pos
-    
-    extrinsic = np.eye(4)
-    extrinsic[:3, :3] = rotation.T
-    extrinsic[:3, 3] = translation
-    
-    return extrinsic
+def _crease_edge_keys(tri, normals, crease_deg):
+    """Klucze krawędzi, na których sąsiednie ściany łamią się o co najmniej crease_deg."""
+    if len(tri) == 0:
+        return np.empty(0, dtype=np.uint64)
+    edges = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+    faces = np.repeat(np.arange(len(tri)), 3)
+    mins = np.minimum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+    maxs = np.maximum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+    keys = (mins << np.uint64(32)) | maxs
+    order = np.argsort(keys, kind="mergesort")
+    keys = keys[order]
+    faces = faces[order]
+    if len(keys) < 2:
+        return np.empty(0, dtype=np.uint64)
+    same_next = keys[1:] == keys[:-1]
+    pair = np.flatnonzero(same_next)
+    # Zostaw tylko pary, które nie są częścią dłuższej grupy.
+    keep = []
+    threshold = np.deg2rad(crease_deg)
+    for i in pair:
+        if i > 0 and keys[i] == keys[i - 1]:
+            continue
+        if i + 2 < len(keys) and keys[i + 1] == keys[i + 2]:
+            continue
+        n0 = normals[faces[i]]
+        n1 = normals[faces[i + 1]]
+        angle = np.arccos(np.clip(np.dot(n0, n1), -1.0, 1.0))
+        if angle >= threshold:
+            keep.append(keys[i])
+    if not keep:
+        return np.empty(0, dtype=np.uint64)
+    return np.asarray(keep, dtype=np.uint64)
 
-def create_line_set(lines_3d):
-    """Tworzy obiekt LineSet z linii 3D"""
-    points = []
-    lines = []
-    
-    for i, (start, end) in enumerate(lines_3d):
-        points.extend([start, end])
-        lines.append([i*2, i*2+1])
-    
-    line_set = o3d.geometry.LineSet()
-    line_set.points = o3d.utility.Vector3dVector(points)
-    line_set.lines = o3d.utility.Vector2iVector(lines)
-    line_set.paint_uniform_color([1, 0, 0])  # Czerwony
-    
-    return line_set
 
-def create_wireframe_render(mesh, camera_pos, look_at, output_path, width, height, lines_3d=None):
-    """Tworzy wireframe render 2D w stylu Blendera"""
+def generate_lines_from_mesh(mesh, camera_pos, threshold=0.1, wireframe=False):
+    """Szybsza, stabilna wersja outline/wireframe."""
+
     vertices = np.asarray(mesh.vertices)
-    triangles = np.asarray(mesh.triangles)
-    
-    if len(vertices) == 0:
-        raise ValueError("Brak wierzchołków w meshu")
-    
-    # Utwórz obraz z gradientem tła
-    img = create_gradient_background(width, height)
-    
-    # Oblicz projekcję
-    view_dir = look_at - camera_pos
-    view_dir = view_dir / np.linalg.norm(view_dir)
-    
-    proj_vertices, axis_labels = project_vertices(vertices, view_dir)
-    
-    # Skalowanie i przesunięcie
-    scaled_vertices = scale_and_center_vertices(proj_vertices, width, height)
-    
-    # Rysuj trójkąty wireframe
-    draw_wireframe_triangles(img, scaled_vertices, triangles)
-    
-    # Rysuj linie ścieżki robota
-    if lines_3d:
-        draw_robot_path_lines(img, lines_3d, view_dir, width, height)
-    
-    add_info_panel(img, mesh, lines_3d, axis_labels)
-    add_coordinate_axes(img, view_dir)
+    tri = np.asarray(mesh.triangles)
 
-    cv2.imwrite(output_path, img)
-    print(f"Wireframe 2D zapisany: {output_path}")
-    return output_path
+    if tri.shape[0] == 0:
+        return []
 
-def add_info_panel(img, mesh, lines_3d, axis_labels):
-    """Krótki opis siatki w rogu zapasowego rysunku 2D."""
-    line_count = 0 if not lines_3d else len(lines_3d)
-    lines = [
-        f"Vertices: {len(mesh.vertices)}  Triangles: {len(mesh.triangles)}",
-        f"Drawing segments: {line_count}",
-        f"Axes: {axis_labels[0]} / {axis_labels[1]}",
-    ]
-    y = 28
-    for text in lines:
-        cv2.putText(img, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
-        y += 24
+    normals = np.asarray(mesh.triangle_normals)
+    centers = vertices[tri].mean(axis=1)
 
+    # BACKFACE CULLING (wrapper wywoła compute_backface_culling_numba gdy numba dostępna)
+    visible = backface_culling(centers, normals, camera_pos, threshold)
+    if not np.any(visible):
+        return []
 
-def add_coordinate_axes(img, view_dir):
-    """Mała legenda osi w lewym dolnym rogu."""
-    if abs(view_dir[2]) > 0.7:
-        labels = ("X", "Y")
-    elif abs(view_dir[1]) > 0.7:
-        labels = ("X", "Z")
+    tri = tri[visible]
+
+    # GENEROWANIE KRAWĘDZI + klucze — zoptymalizowane dla bardzo dużych siatek
+    num_tri = len(tri)
+    if num_tri > LARGE_MESH_TRI and not NUMBA_AVAILABLE:
+        # wielowątkowe budowanie kluczy na kawałkach (ThreadPool)
+        n_workers = min(8, (os.cpu_count() or 4))
+        chunk_size = (num_tri + n_workers - 1) // n_workers
+        chunks = [tri[i*chunk_size:(i+1)*chunk_size] for i in range(n_workers) if i*chunk_size < num_tri]
+
+        pool = ThreadPool(n_workers)
+        try:
+            keys_list = pool.map(_edge_keys_from_tri_chunk, chunks)
+        finally:
+            pool.close()
+            pool.join()
+
+        if keys_list:
+            all_keys = np.concatenate(keys_list)
+        else:
+            all_keys = np.empty(0, dtype=np.uint64)
     else:
-        labels = ("Y", "Z")
+        # standardowy szybki wektorowy wariant (jednowątkowy lub numba later)
+        e0 = tri[:, [0, 1]]
+        e1 = tri[:, [1, 2]]
+        e2 = tri[:, [2, 0]]
+        edges = np.vstack([e0, e1, e2])
+        mins = np.minimum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+        maxs = np.maximum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+        all_keys = (mins << np.uint64(32)) | maxs
 
-    origin = (48, img.shape[0] - 48)
-    cv2.arrowedLine(img, origin, (origin[0] + 70, origin[1]), (80, 80, 255), 2, cv2.LINE_AA)
-    cv2.arrowedLine(img, origin, (origin[0], origin[1] - 70), (80, 255, 80), 2, cv2.LINE_AA)
-    cv2.putText(img, labels[0], (origin[0] + 76, origin[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 255), 1, cv2.LINE_AA)
-    cv2.putText(img, labels[1], (origin[0] - 4, origin[1] - 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 80), 1, cv2.LINE_AA)
+    if all_keys.size == 0:
+        return []
 
+    uniq_keys, counts = np.unique(all_keys, return_counts=True)
 
-def create_gradient_background(width, height):
-    """Tworzy gradientowe tło"""
-    img = np.zeros((height, width, 3), dtype=np.uint8)
-    for y in range(height):
-        color_val = int(30 + (50 - 30) * (y / height))
-        img[y, :] = [color_val, color_val, color_val]
-    return img
+    # Outline: krawędź widoczna z jednej strony. Załamanie: dwie ściany o dużym kącie.
+    boundary_keys = uniq_keys[counts == 1]
+    crease_keys = _crease_edge_keys(tri, normals[visible], Config.CREASE_ANGLE_DEG)
+    if crease_keys.size:
+        feature_keys = np.unique(np.concatenate([boundary_keys, crease_keys]))
+    else:
+        feature_keys = boundary_keys
 
-def project_vertices(vertices, view_dir):
-    """Projektuje wierzchołki 3D na 2D w zależności od kierunku widoku"""
-    if abs(view_dir[2]) > 0.7:  # Widok z góry/dołu
-        proj = vertices[:, :2]
-        labels = ('X', 'Y')
-    elif abs(view_dir[1]) > 0.7:  # Widok z przodu/tyłu
-        proj = vertices[:, [0, 2]]
-        labels = ('X', 'Z')
-    else:  # Widok z boku
-        proj = vertices[:, [1, 2]]
-        labels = ('Y', 'Z')
+    if len(feature_keys) == 0:
+        return []
+    boundary_keys = feature_keys
+
+    # Odtwarzamy pary vertexów
+    boundary = np.column_stack([
+        (boundary_keys >> 32).astype(np.int32),
+        (boundary_keys & np.uint64(0xFFFFFFFF)).astype(np.int32)
+    ])
+
+    # ŁĄCZENIE W ŁAŃCUCHY
+    chains = chain_segments(boundary.tolist(), vertices)
+    if not chains:
+        return [(vertices[a], vertices[b]) for a, b in boundary]
+
+    chains = optimize_chain_order(chains)
+
+    # KONWERSJA NA LINIE
+    lines = []
+    for chain in chains:
+        for i in range(len(chain) - 1):
+            lines.append((chain[i], chain[i + 1]))
+
+    return remove_artifacts(lines)
+
+@measure_time
+def generate_lines(original_mesh, simplified_mesh, camera_pos, threshold=0.1, wireframe=False):
+    """Generuje linie z obu meshy - oryginalnego i uproszczonego"""
+    if wireframe:
+        # Dla wireframe używamy tylko uproszczonego mesha
+        return generate_lines_from_mesh(simplified_mesh, camera_pos, threshold, True)
+    else:
+        # Dla outline używamy OBIEGU meshy dla maksymalnej ciągłości
+        original_lines = generate_lines_from_mesh(original_mesh, camera_pos, threshold, False)
+        simplified_lines = generate_lines_from_mesh(simplified_mesh, camera_pos, threshold, False)
+        
+        # Połącz linie z obu meshy, preferując oryginalny dla lepszej jakości
+        combined_lines = []
+        
+        # Najpierw dodaj linie z oryginalnego mesha (bardziej szczegółowe)
+        combined_lines.extend(original_lines)
+        
+        # Dodaj unikalne linie z uproszczonego mesha, które uzupełniają luki
+        original_set = set()
+        for line in original_lines:
+            # Tworzymy klucz niezależny od kolejności punktów
+            key = tuple(sorted([tuple(line[0].round(4)), tuple(line[1].round(4))]))
+            original_set.add(key)
+        
+        for line in simplified_lines:
+            key = tuple(sorted([tuple(line[0].round(4)), tuple(line[1].round(4))]))
+            if key not in original_set:
+                combined_lines.append(line)
+        
+        # Usuń artefakty z połączonego zestawu
+        combined_lines = remove_artifacts(combined_lines)
+        
+        return combined_lines
+
+@measure_time
+def optimize_path(lines, max_lines=5000):
+    """Optymalizuje kolejność linii dla minimalnego czasu podróży"""
+    if not lines or len(lines) <= 1:
+        return lines
     
-    return proj, labels
+    # Konwertuj na numpy arrays dla wydajności
+    starts = np.array([l[0] for l in lines], dtype=np.float32)
+    ends = np.array([l[1] for l in lines], dtype=np.float32)
+    
+    optimized = []
+    used = np.zeros(len(lines), dtype=bool)
+    
+    # Zacznij od linii najbliżej środka
+    center = np.mean(np.vstack([starts, ends]), axis=0)
+    distances = np.linalg.norm(starts - center, axis=1)
+    start_idx = np.argmin(distances)
+    
+    optimized.append(lines[start_idx])
+    used[start_idx] = True
+    current_end = ends[start_idx]
+    
+    # Optymalizuj kolejność pozostałych linii
+    for _ in range(len(lines) - 1):
+        if NUMBA_AVAILABLE:
+            best_idx, flip = find_nearest_numba(current_end, starts, ends, used)
+        else:
+            unused_mask = ~used
+            if not np.any(unused_mask):
+                break
+                
+            unused_indices = np.where(unused_mask)[0]
+            dist_to_starts = np.linalg.norm(starts[unused_indices] - current_end, axis=1)
+            dist_to_ends = np.linalg.norm(ends[unused_indices] - current_end, axis=1)
+            
+            min_start_idx = np.argmin(dist_to_starts)
+            min_end_idx = np.argmin(dist_to_ends)
+            
+            if dist_to_starts[min_start_idx] < dist_to_ends[min_end_idx]:
+                best_idx = unused_indices[min_start_idx]
+                flip = False
+            else:
+                best_idx = unused_indices[min_end_idx]
+                flip = True
+        
+        if best_idx == -1:
+            break
+            
+        used[best_idx] = True
+        line = lines[best_idx]
+        
+        if flip:
+            line = (line[1], line[0])
+            
+        optimized.append(line)
+        current_end = line[1]
+    
+    return optimized
 
-def scale_and_center_vertices(vertices_2d, width, height, margin=0.1):
-    """Skaluje i centruje wierzchołki 2D w obrazie"""
-    min_vals = np.min(vertices_2d, axis=0)
-    max_vals = np.max(vertices_2d, axis=0)
-    ranges = max_vals - min_vals
+# ---------------------
+# Renderowanie
+# ---------------------
+@measure_time
+def render_png(lines, output_path, view_dir):
+    """Renderuje linie do PNG"""
+    img = np.zeros((Config.IMAGE_HEIGHT, Config.IMAGE_WIDTH, 3), dtype=np.uint8)
+    img[:] = 40
     
-    if np.any(ranges < 1e-6):
-        ranges = np.where(ranges < 1e-6, 1.0, ranges)
-    
-    scale = min(width * (1 - 2*margin) / ranges[0], 
-                height * (1 - 2*margin) / ranges[1])
-    
-    center = (min_vals + max_vals) / 2
-    scaled = (vertices_2d - center) * scale
-    
-    scaled[:, 0] += width // 2
-    scaled[:, 1] += height // 2
-    
-    return scaled.astype(int)
-
-def draw_wireframe_triangles(img, vertices_2d, triangles):
-    """Rysuje trójkąty jako wireframe"""
-    triangle_count = 0
-    for tri in triangles:
-        if all(0 <= vertices_2d[idx][0] < img.shape[1] and 
-               0 <= vertices_2d[idx][1] < img.shape[0] for idx in tri):
-            pts = vertices_2d[tri]
-            cv2.polylines(img, [pts], True, (180, 180, 180), 1, cv2.LINE_AA)
-            triangle_count += 1
-    print(f"Narysowano {triangle_count} trójkątów wireframe")
-
-def draw_robot_path_lines(img, lines_3d, view_dir, width, height):
-    """Rysuje linie ścieżki robota"""
-    if not lines_3d:
+    if not lines:
+        cv2.imwrite(output_path, img)
         return
     
-    # Ogranicz liczbę rysowanych linii dla wydajności
-    max_lines_to_draw = 10000
-    if len(lines_3d) > max_lines_to_draw:
-        print(f"Rysowanie {max_lines_to_draw}/{len(lines_3d)} linii ścieżki robota")
-        step = len(lines_3d) // max_lines_to_draw
-        lines_to_draw = lines_3d[::step]
-    else:
-        lines_to_draw = lines_3d
+    axes = get_projection_axes(view_dir)
+    pts_2d = np.array([[l[0][axes], l[1][axes]] for l in lines]).reshape(-1, 2)
     
-    # Najpierw projekcja wszystkich punktów
-    vertices = []
-    for start_3d, end_3d in lines_to_draw:
-        if abs(view_dir[2]) > 0.7:
-            vertices.append(start_3d[:2])
-            vertices.append(end_3d[:2])
-        elif abs(view_dir[1]) > 0.7:
-            vertices.append(start_3d[[0, 2]])
-            vertices.append(end_3d[[0, 2]])
-        else:
-            vertices.append(start_3d[[1, 2]])
-            vertices.append(end_3d[[1, 2]])
+    min_v, max_v = pts_2d.min(axis=0), pts_2d.max(axis=0)
+    ranges = np.maximum(max_v - min_v, 1e-3)
+    scale = min(Config.IMAGE_WIDTH * 0.8 / ranges[0], Config.IMAGE_HEIGHT * 0.8 / ranges[1])
+    center = (min_v + max_v) / 2
+    offset = np.array([Config.IMAGE_WIDTH, Config.IMAGE_HEIGHT]) / 2
     
-    vertices = np.array(vertices)
+    for s, e in lines:
+        p1 = ((s[axes] - center) * scale + offset).astype(int)
+        p2 = ((e[axes] - center) * scale + offset).astype(int)
+        cv2.line(img, tuple(p1), tuple(p2), (0, 0, 255), 2, cv2.LINE_AA)
     
-    # Skalowanie i centrowanie
-    min_vals = np.min(vertices, axis=0)
-    max_vals = np.max(vertices, axis=0)
-    ranges = max_vals - min_vals
-    ranges = np.where(ranges < 1e-6, 1.0, ranges)
-    
-    margin = 0.15
-    scale = min(width * (1 - 2*margin) / ranges[0], 
-                height * (1 - 2*margin) / ranges[1])
-    
-    center = (min_vals + max_vals) / 2
-    scaled = (vertices - center) * scale
-    scaled[:, 0] += width // 2
-    scaled[:, 1] += height // 2
-    scaled = scaled.astype(int)
-    
-    # Rysuj linie
-    line_count = 0
-    for i in range(0, len(scaled), 2):
-        if i+1 < len(scaled):
-            start_2d = tuple(scaled[i])
-            end_2d = tuple(scaled[i+1])
-            
-            if (0 <= start_2d[0] < width and 0 <= start_2d[1] < height and
-                0 <= end_2d[0] < width and 0 <= end_2d[1] < height):
-                cv2.line(img, start_2d, end_2d, (0, 0, 255), 2, cv2.LINE_AA)
-                line_count += 1
-    
-    print(f"Narysowano {line_count} linii ścieżki robota")
+    cv2.imwrite(output_path, img)
+    print(f"PNG: {output_path}")
 
 # ---------------------
-# Eksport ścieżek robota
+# Logo paths
 # ---------------------
-@measure_time
-def export_robot_data(polylines, output_dir, name="robot_path"):
-    """Eksportuje łamane rysunku. Przerwa między niepołączonymi kreskami podnosi pisak."""
-    os.makedirs(output_dir, exist_ok=True)
+LOGO_PATHS = {
+    "min": os.path.join(os.path.dirname(__file__), "logos", "min.svg"),
+    "full": os.path.join(os.path.dirname(__file__), "logos", "full.svg"),
+}
 
-    if not polylines:
-        print("Brak linii do eksportu")
-        return None
-
-    segments = polylines_to_segments(polylines)
-    print(f"Eksport {len(polylines)} łamanych ({len(segments)} odcinków)...")
-
-    points = np.vstack(polylines)
-    points_file = os.path.join(output_dir, f"{name}_points.txt")
-    np.savetxt(points_file, points, fmt="%.6f")
-
-    lines_file = os.path.join(output_dir, f"{name}_lines.txt")
-    with open(lines_file, "w") as handle:
-        for start, end in segments:
-            handle.write(
-                f"{start[0]:.6f} {start[1]:.6f} {start[2]:.6f} "
-                f"{end[0]:.6f} {end[1]:.6f} {end[2]:.6f}\n"
-            )
-
-    commands_file = export_hanwha_commands(polylines, output_dir, name)
-    
-    print(f"Dane robota zapisane:")
-    print(f"  - Punkty: {points_file}")
-    print(f"  - Linie: {lines_file}")
-    print(f"  - Komendy: {commands_file}")
-    
-    return points_file
-
-@measure_time
-def export_hanwha_commands(polylines, output_dir, name):
-    """Generuje komendy dla robota Hanwha HCR-3A. MOVE_LIFT tylko przy prawdziwej przerwie."""
-    commands_file = os.path.join(output_dir, f"{name}_hanwha_commands.txt")
-    stats_file = os.path.join(output_dir, f"{name}_stats.json")
-    lift_gap = Config.VOXEL_SIZE * 0.25
-    commands = drawing_commands(polylines, lift_gap)
-
-    with open(commands_file, "w") as handle:
-        handle.write("# Komendy robota Hanwha HCR-3A\n")
-        handle.write(f"# Wygenerowano: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        handle.write(f"# Liczba łamanych: {len(polylines)}\n\n")
-        handle.write("INIT\n")
-        handle.write(f"SET_SPEED DRAW={Config.DRAWING_SPEED} TRAVEL={Config.TRAVEL_SPEED}\n")
-        handle.write(f"SET_Z_LIFT {Config.Z_LIFT}\n\n")
-        handle.write("START_DRAWING\n")
-        for kind, point in commands:
-            coords = f"{point[0]*1000:.3f} {point[1]*1000:.3f} {point[2]*1000:.3f}"
-            if kind == "lift":
-                handle.write(f"MOVE_LIFT {coords}\n")
-            else:
-                handle.write(f"LINE {coords}\n")
-        handle.write("\nSTOP_DRAWING\n")
-        handle.write("RETURN_HOME\n")
-
-    stats = calculate_path_statistics(polylines, lift_gap)
-    with open(stats_file, 'w') as f:
-        json.dump(stats, f, indent=2)
-    
-    print(f"Statystyki: {stats_file}")
-    print(f"  - Całkowita długość rysowania: {stats['total_drawing_length']:.2f} mm")
-    print(f"  - Całkowita długość przemieszczania: {stats['total_travel_length']:.2f} mm")
-    print(f"  - Szacowany czas: {stats['estimated_total_time']:.2f} s")
-    
-    return commands_file
-
-def drawing_commands(polylines, lift_gap):
-    """Punkty łamanej to LINE. MOVE_LIFT tylko przy starcie nowej, niepołączonej kreski."""
-    commands = []
-    pen = None
-    for poly in polylines:
-        points = np.asarray(poly, dtype=float)
-        if len(points) == 0:
-            continue
-        if pen is None or np.linalg.norm(points[0] - pen) > lift_gap:
-            commands.append(("lift", points[0]))
-        pen = points[0]
-        for point in points[1:]:
-            if np.linalg.norm(point - pen) > 1e-6:
-                commands.append(("line", point))
-            pen = point
-    return commands
-
-
-def calculate_path_statistics(polylines, lift_gap):
-    """Długość rysowania i przejazdów w milimetrach."""
-    drawing_length = 0.0
-    travel_length = 0.0
-    pen = None
-    segments = 0
-    for poly in polylines:
-        points = np.asarray(poly, dtype=float)
-        if len(points) == 0:
-            continue
-        if pen is not None:
-            gap = np.linalg.norm(points[0] - pen) * 1000
-            if gap > lift_gap * 1000:
-                travel_length += gap
-        for start, end in zip(points, points[1:]):
-            drawing_length += np.linalg.norm(end - start) * 1000
-            segments += 1
-        pen = points[-1]
-
-    drawing_time = drawing_length / Config.DRAWING_SPEED
-    travel_time = travel_length / Config.TRAVEL_SPEED
-    return {
-        "total_polylines": len(polylines),
-        "total_lines": segments,
-        "total_drawing_length": drawing_length,
-        "total_travel_length": travel_length,
-        "estimated_drawing_time": drawing_time,
-        "estimated_travel_time": travel_time,
-        "estimated_total_time": drawing_time + travel_time,
-        "drawing_speed": Config.DRAWING_SPEED,
-        "travel_speed": Config.TRAVEL_SPEED,
-    }
-
-# ---------------------
-# Wizualizacja interaktywna
-# ---------------------
-def interactive_visualization(mesh, lines_3d=None):
-    """Interaktywna wizualizacja meshu i ścieżki"""
-    geometries = [mesh]
-    
-    if lines_3d:
-        line_set = create_line_set(lines_3d)
-        geometries.append(line_set)
-    
-    geometries.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5))
-    
-    print("Otwieranie wizualizacji...")
-    print("Sterowanie:")
-    print("  - Lewy przycisk + przeciąganie: obracanie")
-    print("  - Prawy przycisk + przeciąganie: przesuwanie")
-    print("  - Kółko myszy: przybliżanie/oddalanie")
-    print("  - [H] - pomoc, [Q] - wyjście")
-    
-    o3d.visualization.draw_geometries(geometries, window_name="Mesh + Robot Path")
-
-# ---------------------
-# Główna funkcja
-# ---------------------
-@measure_time
-def main(point_cloud_path, camera_position=None, look_at_point=None):
-    """Główna funkcja przetwarzająca chmurę punktów"""
-    print("=" * 60)
-    print("CHMURA PUNKTÓW -> MESH -> ŚCIEŻKA ROBOTA")
-    print("=" * 60)
-    
-    # Wczytaj chmurę punktów
-    points_data = load_point_cloud(point_cloud_path)
-    print(f"Wczytano {len(points_data)} punktów")
-    
-    # Przetwarzanie wstępne
-    clean_points = preprocess_point_cloud(points_data, voxel_size=Config.VOXEL_SIZE)
-    
-    # Budowa meshu
-    mesh = build_mesh(clean_points, method="poisson", depth=Config.POISSON_DEPTH)
-    
-    # Automatyczna konfiguracja kamery jeśli nie podana
-    if camera_position is None or look_at_point is None:
-        bounds = mesh.get_axis_aligned_bounding_box()
-        center = bounds.get_center()
-        extent = bounds.get_extent()
-        
-        if camera_position is None:
-            camera_position = center + np.array([0, -extent[1]*2, extent[2]*1.5])
-        if look_at_point is None:
-            look_at_point = center
-    
-    print(f"Kamera: {camera_position}")
-    print(f"Cel: {look_at_point}")
-    
-    segments = extract_feature_edges(
-        mesh,
-        camera_position,
-        threshold=Config.VISIBILITY_THRESHOLD,
-        crease_deg=Config.CREASE_ANGLE_DEG,
-    )
-    polylines = chain_segments(segments)
-    epsilon = Config.VOXEL_SIZE * Config.EDGE_SIMPLIFY_VOXELS
-    polylines = [simplify_polyline(poly, epsilon) for poly in polylines]
-    polylines = [poly for poly in polylines if len(poly) >= 2]
-    polylines = order_polylines(polylines)
-    lines_3d = polylines_to_segments(polylines)
-    print(f"Ścieżka rysunku: {len(polylines)} łamanych, {len(lines_3d)} odcinków")
-
-    # Renderuj widok
-    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-    render_output = os.path.join(Config.OUTPUT_DIR, "mesh_render.png")
-    render_mesh_view(mesh, camera_position, look_at_point, render_output, 
-                    Config.IMAGE_WIDTH, Config.IMAGE_HEIGHT, lines_3d)
-    
-    # Eksport danych robota
-    export_robot_data(polylines, Config.OUTPUT_DIR)
-    
-    # Zapisz mesh
-    mesh_output = os.path.join(Config.OUTPUT_DIR, "reconstructed_mesh.ply")
-    o3d.io.write_triangle_mesh(mesh_output, mesh)
-    print(f"Mesh zapisany: {mesh_output}")
-    
-    # Wizualizacja interaktywna
+def get_svg_dimensions(svg_path):
+    """Pobiera wymiary SVG"""
     try:
-        interactive_visualization(mesh, lines_3d)
-    except Exception as e:
-        print(f"Błąd wizualizacji: {e}")
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        
+        # Próbuj viewBox
+        viewbox = root.get('viewBox')
+        if viewbox:
+            parts = viewbox.split()
+            if len(parts) == 4:
+                return float(parts[2]), float(parts[3])
+        
+        # Próbuj width/height
+        w = root.get('width', '100')
+        h = root.get('height', '100')
+        w = float(''.join(c for c in w if c.isdigit() or c == '.') or '100')
+        h = float(''.join(c for c in h if c.isdigit() or c == '.') or '100')
+        return w, h
+    except:
+        return 100, 100
+
+def copy_element(elem):
+    """Rekurencyjnie kopiuje element XML usuwając namespace"""
+    # Usuń namespace z tagu
+    tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
     
-    print("Przetwarzanie zakończone!")
+    # Skopiuj atrybuty (usuń namespace z kluczy)
+    attrib = {}
+    for k, v in elem.attrib.items():
+        key = k.split('}')[-1] if '}' in k else k
+        attrib[key] = v
+    
+    new_elem = ET.Element(tag, attrib)
+    new_elem.text = elem.text
+    new_elem.tail = elem.tail
+    
+    # Rekurencyjnie kopiuj dzieci
+    for child in elem:
+        new_elem.append(copy_element(child))
+    
+    return new_elem
+
+def embed_logo_in_svg(svg_path, logo_type, drawing_bounds):
+    """Osadza logo w SVG - w rogu kartki"""
+    logo_path = LOGO_PATHS.get(logo_type)
+    if not logo_path or not os.path.exists(logo_path):
+        print(f"Logo nie znalezione: {logo_path}")
+        return
+    
+    # Zarejestruj namespace SVG
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
+    
+    # Parsuj główny SVG
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+    
+    # Pobierz wymiary papieru
+    paper_w, paper_h = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+    if Config.PAPER_LANDSCAPE:
+        paper_w, paper_h = paper_h, paper_w
+    
+    # Pobierz wymiary logo
+    logo_w, logo_h = get_svg_dimensions(logo_path)
+    
+    margin = Config.PAPER_MARGIN
+    min_y, max_y = drawing_bounds
+    
+    # Stały rozmiar logo (dopasowany do rogu)
+    max_logo_w = 100  # mm
+    max_logo_h = 50  # mm
+    
+    if logo_type == "min":
+        max_logo_w *= .75 
+        max_logo_h *= .75
+    
+    logo_scale = min(max_logo_w / logo_w, max_logo_h / logo_h)
+    scaled_logo_w = logo_w * logo_scale
+    scaled_logo_h = logo_h * logo_scale
+    
+    # Sprawdź który róg jest wolny
+    # Preferuj prawy dolny róg
+    corners = [
+        ("bottom_right", paper_w - margin - scaled_logo_w, paper_h - margin - scaled_logo_h),
+        ("bottom_left", margin, paper_h - margin - scaled_logo_h),
+        ("top_right", paper_w - margin - scaled_logo_w, margin),
+        ("top_left", margin, margin),
+    ]
+    
+    # Wybierz pierwszy wolny róg (nie kolidujący z rysunkiem)
+    logo_x, logo_y = corners[0][1], corners[0][2]  # domyślnie prawy dolny
+    
+    for corner_name, cx, cy in corners:
+        # Sprawdź czy róg nie koliduje z rysunkiem
+        if cy + scaled_logo_h < min_y - 3 or cy > max_y + 3:
+            logo_x, logo_y = cx, cy
+            break
+    
+    # Parsuj logo SVG
+    logo_tree = ET.parse(logo_path)
+    logo_root = logo_tree.getroot()
+    
+    # Oblicz stroke-width
+    stroke_width = max(0.3, min(1.0 / logo_scale * 0.4, 1.5))
+    
+    # Stwórz grupę z transformacją
+    g = ET.SubElement(root, 'g')
+    g.set('transform', f'translate({logo_x:.2f},{logo_y:.2f}) scale({logo_scale:.6f})')
+    g.set('id', 'logo')
+    g.set('fill', 'none')
+    g.set('stroke', 'black')
+    g.set('stroke-width', f'{stroke_width:.2f}')
+    
+    # Kopiuj wszystkie dzieci logo do grupy
+    for child in logo_root:
+        copied = copy_element_outline(child)
+        g.append(copied)
+    
+    # Zapisz
+    with open(svg_path, 'wb') as f:
+        tree.write(f, encoding='utf-8', xml_declaration=True)
+    
+    print(f"Logo '{logo_type}' w rogu ({scaled_logo_w:.1f}x{scaled_logo_h:.1f}mm)")
+
+def copy_element_outline(elem):
+    """Rekurencyjnie kopiuje element XML usuwając namespace i wymuszając outline"""
+    tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+    
+    # Skopiuj atrybuty (usuń namespace z kluczy)
+    attrib = {}
+    for k, v in elem.attrib.items():
+        key = k.split('}')[-1] if '}' in k else k
+        # Usuń atrybuty fill (wymuszamy outline)
+        if key.lower() == 'fill':
+            continue
+        # Zachowaj stroke jeśli jest
+        attrib[key] = v
+    
+    new_elem = ET.Element(tag, attrib)
+    new_elem.text = elem.text
+    new_elem.tail = elem.tail
+    
+    # Rekurencyjnie kopiuj dzieci
+    for child in elem:
+        new_elem.append(copy_element_outline(child))
+    
+    return new_elem
+
+def render_svg(lines, output_path, view_dir, logo_type=None):
+    """Renderuje linie do SVG używając svgwrite"""
+    paper_w, paper_h = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+    if Config.PAPER_LANDSCAPE:
+        paper_w, paper_h = paper_h, paper_w
+    
+    dwg = svgwrite.Drawing(output_path, size=(f"{paper_w}mm", f"{paper_h}mm"),
+                           viewBox=f"0 0 {paper_w} {paper_h}")
+    
+    drawing_bounds = (paper_h / 2, paper_h / 2)  # domyślne
+    
+    if lines:
+        axes = get_projection_axes(view_dir)
+        pts_2d = np.array([[l[0][axes], l[1][axes]] for l in lines]).reshape(-1, 2)
+        
+        min_v, max_v = pts_2d.min(axis=0), pts_2d.max(axis=0)
+        ranges = np.maximum(max_v - min_v, 1e-3)
+        margin = Config.PAPER_MARGIN
+        scale = min((paper_w - 2*margin) / ranges[0], (paper_h - 2*margin) / ranges[1])
+        center = (min_v + max_v) / 2
+        offset = np.array([paper_w, paper_h]) / 2
+        
+        g = dwg.g(stroke="black", stroke_width="0.5", fill="none")
+        
+        y_coords = []
+        for s, e in lines:
+            p1 = (s[axes] - center) * scale + offset
+            p2 = (e[axes] - center) * scale + offset
+            g.add(dwg.line(start=(p1[0], p1[1]), end=(p2[0], p2[1])))
+            y_coords.extend([p1[1], p2[1]])
+        
+        dwg.add(g)
+        
+        if y_coords:
+            drawing_bounds = (min(y_coords), max(y_coords))
+    
+    dwg.save()
+    print(f"SVG: {output_path}")
+    
+    # Dodaj logo jeśli podano
+    if logo_type:
+        embed_logo_in_svg(output_path, logo_type, drawing_bounds)
 
 # ---------------------
-# Entry point
+# Eksport i skalowanie - ZMODYFIKOWANE
 # ---------------------
+@measure_time
+def load_and_scale_mesh(path, max_triangles=None):
+    """Wczytuje i skaluje mesh – zoptymalizowana wersja (2–5× szybsza)."""
+    mesh = o3d.io.read_triangle_mesh(path)
+
+    # Zachowaj tylko kopię geometrii wierzchołków – nie całego mesha
+    original_vertices = np.asarray(mesh.vertices).copy()
+    original_triangles = np.asarray(mesh.triangles).copy()
+
+    # Uproszczenie (duże przyspieszenie – nie liczymy nic podwójnie)
+    if max_triangles and len(mesh.triangles) > max_triangles:
+        mesh = mesh.simplify_quadric_decimation(max_triangles)
+        print(f"Decimation: {len(original_triangles)} → {len(mesh.triangles)}")
+
+    # Wyczyszczenie tylko tego, co niezbędne
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_triangle_normals()
+
+    # --- Skalowanie ---
+    paper_w, paper_h = Config.PAPER_SIZES[Config.PAPER_FORMAT]
+    if Config.PAPER_LANDSCAPE:
+        paper_w, paper_h = paper_h, paper_w
+
+    bbox = mesh.get_axis_aligned_bounding_box()
+    extent = np.asarray(bbox.get_extent())
+    center = np.asarray(bbox.get_center())
+
+    usable = np.array([paper_w, paper_h]) - 2 * Config.PAPER_MARGIN
+    max_z = Config.ROBOT_WORKSPACE_Z - Config.ROBOT_SAFE_Z - 10
+
+    scale = min(
+        usable[0] / max(extent[0], 1e-6),
+        usable[1] / max(extent[1], 1e-6),
+        max_z     / max(extent[2], 1e-6),
+    )
+
+    # macierz transformacji (szybciej niż osobne działania)
+    T = np.eye(4)
+    T[0, 0] = scale
+    T[1, 1] = scale
+    T[2, 2] = scale
+
+    T[:3, 3] = [
+        paper_w / 2 - center[0] * scale,
+        paper_h / 2 - center[1] * scale,
+        Config.ROBOT_SAFE_Z + (extent[2] * scale) / 2 - center[2] * scale
+    ]
+
+    mesh.transform(T)
+
+    # Zastosuj tę samą transformację do oryginalnego mesha
+    original = o3d.geometry.TriangleMesh()
+    original.vertices = o3d.utility.Vector3dVector(original_vertices)
+    original.triangles = o3d.utility.Vector3iVector(original_triangles)
+    original.transform(T)
+    original.compute_triangle_normals()
+
+    print(f"Mesh scaled: scale={scale:.3f}, triangles={len(mesh.triangles)}")
+
+    return original, mesh
+
+# ---------------------
+# Main - ZMODYFIKOWANE
+# ---------------------
+def main(mesh_path, camera_pos=None, look_at=None, dev_mode=False, save_mesh=False, logo_type=None):
+    print("=" * 50)
+    print("MESH -> ROBOT PATH CONVERTER")
+    print("=" * 50)
+    
+    # Wczytaj OBIE wersje mesha - oryginalną i uproszczoną
+    original_mesh, simplified_mesh = load_and_scale_mesh(mesh_path, Config.MAX_TRIANGLES)
+    bounds = simplified_mesh.get_axis_aligned_bounding_box()
+    center = bounds.get_center()
+    extent = bounds.get_extent()
+    
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+    
+    if dev_mode:
+        png_dir = os.path.join(Config.OUTPUT_DIR, "png")
+        svg_dir = os.path.join(Config.OUTPUT_DIR, "svg")
+        os.makedirs(png_dir, exist_ok=True)
+        os.makedirs(svg_dir, exist_ok=True)
+        
+        safe_dist = max(extent[0], extent[1]) * 2.5
+        max_ext = np.max(extent)
+        positions = [
+            ("front", np.array([0, -safe_dist, max_ext])),
+            ("side", np.array([safe_dist, 0, max_ext])),
+            ("corner", np.array([safe_dist*0.7, -safe_dist*0.7, max_ext*1.5])),
+            ("top", np.array([0, 0, safe_dist])),
+        ]
+        
+        for name, offset in positions:
+            cam = center + offset
+            view_dir = (center - cam) / np.linalg.norm(center - cam)
+            # Outline: zapisz osobno oryginalny, uproszczony i merged
+            orig_lines = generate_lines_from_mesh(original_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=False)
+            simpl_lines = generate_lines_from_mesh(simplified_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=False)
+            merged_lines = generate_lines(original_mesh, simplified_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=False)
+
+            # NOWE: orig_optimized bazujące na oryginalnym meshu (uproszczone łańcuchy)
+            orig_optimized_lines = generate_orig_optimized(original_mesh, cam, view_dir, Config.VISIBILITY_THRESHOLD, epsilon=0.5, min_noise=0.05, area=0.01)
+
+            if orig_lines:
+                orig_opt = optimize_path(orig_lines)
+                render_png(orig_opt, os.path.join(png_dir, f"{name}_outline_orig.png"), view_dir)
+                render_svg(orig_opt, os.path.join(svg_dir, f"{name}_outline_orig.svg"), view_dir, logo_type)
+            if simpl_lines:
+                simpl_opt = optimize_path(simpl_lines)
+                render_png(simpl_opt, os.path.join(png_dir, f"{name}_outline_simpl.png"), view_dir)
+                render_svg(simpl_opt, os.path.join(svg_dir, f"{name}_outline_simpl.svg"), view_dir, logo_type)
+            if merged_lines:
+                merged_opt = optimize_path(merged_lines)
+                render_png(merged_opt, os.path.join(png_dir, f"{name}_outline.png"), view_dir)
+                render_svg(merged_opt, os.path.join(svg_dir, f"{name}_outline.svg"), view_dir, logo_type)
+
+            # NOWE: zapisz orig_optimized
+            if orig_optimized_lines:
+                oo_opt = optimize_path(orig_optimized_lines)
+                render_png(oo_opt, os.path.join(png_dir, f"{name}_outline_orig_optimized.png"), view_dir)
+                render_svg(oo_opt, os.path.join(svg_dir, f"{name}_outline_orig_optimized.svg"), view_dir, logo_type)
+
+            # Wireframe (jak wcześniej) - tylko uproszczony mesh
+            wf_lines = generate_lines_from_mesh(simplified_mesh, cam, Config.VISIBILITY_THRESHOLD, wireframe=True)
+            if wf_lines:
+                wf_opt = optimize_path(wf_lines)
+                render_png(wf_opt, os.path.join(png_dir, f"{name}_wireframe.png"), view_dir)
+                render_svg(wf_opt, os.path.join(svg_dir, f"{name}_wireframe.svg"), view_dir, logo_type)
+    else:
+        if camera_pos is None:
+            dist = max(extent[0], extent[1]) * 2.5
+            camera_pos = center + np.array([0, 0, dist])
+            look_at = center
+            R = simplified_mesh.get_rotation_matrix_from_xyz((0, 0, np.pi))
+            simplified_mesh.rotate(R, center=center)
+            original_mesh.rotate(R, center=center)
+        
+        view_dir = (look_at - camera_pos) / np.linalg.norm(look_at - camera_pos)
+        
+        # Outline: oryginalny, uproszczony i merged
+        orig_lines = generate_lines_from_mesh(original_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=False)
+        simpl_lines = generate_lines_from_mesh(simplified_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=False)
+        merged_lines = generate_lines(original_mesh, simplified_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=False)
+
+        # NOWE: orig_optimized
+        orig_optimized_lines = generate_orig_optimized(original_mesh, camera_pos, view_dir, Config.VISIBILITY_THRESHOLD, epsilon=0.5, min_noise=0.05, area=0.01)
+
+        if orig_lines:
+            orig_opt = optimize_path(orig_lines)
+            render_png(orig_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig.png"), view_dir)
+            render_svg(orig_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig.svg"), view_dir, logo_type)
+        if simpl_lines:
+            simpl_opt = optimize_path(simpl_lines)
+            render_png(simpl_opt, os.path.join(Config.OUTPUT_DIR, "outline_simpl.png"), view_dir)
+            render_svg(simpl_opt, os.path.join(Config.OUTPUT_DIR, "outline_simpl.svg"), view_dir, logo_type)
+        if merged_lines:
+            merged_opt = optimize_path(merged_lines)
+            render_png(merged_opt, os.path.join(Config.OUTPUT_DIR, "outline.png"), view_dir)
+            render_svg(merged_opt, os.path.join(Config.OUTPUT_DIR, "outline.svg"), view_dir, logo_type)
+        
+        # NOWE: zapisz orig_optimized (poza resztą)
+        if orig_optimized_lines:
+            oo_opt = optimize_path(orig_optimized_lines)
+            render_png(oo_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig_optimized.png"), view_dir)
+            render_svg(oo_opt, os.path.join(Config.OUTPUT_DIR, "outline_orig_optimized.svg"), view_dir, logo_type)
+
+        # Wireframe (jak wcześniej) - tylko uproszczony mesh
+        wf_lines = generate_lines_from_mesh(simplified_mesh, camera_pos, Config.VISIBILITY_THRESHOLD, wireframe=True)
+        if wf_lines:
+            wf_opt = optimize_path(wf_lines)
+            render_png(wf_opt, os.path.join(Config.OUTPUT_DIR, "wireframe.png"), view_dir)
+            render_svg(wf_opt, os.path.join(Config.OUTPUT_DIR, "wireframe.svg"), view_dir, logo_type)
+    
+    if save_mesh:
+        o3d.io.write_triangle_mesh(os.path.join(Config.OUTPUT_DIR, "mesh_original.ply"), original_mesh)
+        o3d.io.write_triangle_mesh(os.path.join(Config.OUTPUT_DIR, "mesh_simplified.ply"), simplified_mesh)
+        print(f"Meshe zapisane: {Config.OUTPUT_DIR}/mesh_*.ply")
+    
+    print(f"\n✅ Gotowe! -> {Config.OUTPUT_DIR}/")
+
+def _rdp_indices(points, eps):
+    """Zwraca indeksy punktów po uproszczeniu RDP (2D)"""
+    if len(points) <= 2:
+        return list(range(len(points)))
+
+    def point_line_distance(pt, a, b):
+        # odległość punktu pt od odcinka ab (2D)
+        if np.allclose(a, b):
+            return np.linalg.norm(pt - a)
+        num = abs((b[0]-a[0])*(a[1]-pt[1]) - (a[0]-pt[0])*(b[1]-a[1]))
+        den = np.hypot(b[0]-a[0], b[1]-a[1])
+        return num / den
+
+    idxs = []
+
+    def rdp_rec(s, e):
+        if e <= s + 1:
+            return
+        a = points[s]; b = points[e]
+        max_d = -1.0; max_i = -1
+        for i in range(s+1, e):
+            d = point_line_distance(points[i], a, b)
+            if d > max_d:
+                max_d = d; max_i = i
+        if max_d > eps:
+            rdp_rec(s, max_i)
+            rdp_rec(max_i, e)
+        else:
+            # no intermediate points needed
+            idxs.append(s)
+            idxs.append(e)
+
+    rdp_rec(0, len(points)-1)
+    if not idxs:
+        return list(range(len(points)))
+    # uporządkuj i usuń duplikaty
+    idxs = sorted(set(idxs))
+    # upewnij się, że są zawarte końce
+    if idxs[0] != 0:
+        idxs.insert(0, 0)
+    if idxs[-1] != len(points)-1:
+        idxs.append(len(points)-1)
+    return idxs
+
+def generate_orig_optimized(original_mesh, camera_pos, view_dir, threshold=0.1, epsilon=0.5, min_noise=0.05, area=0.01):
+    """
+    Wyciąga outline z ORYGINALNEGO mesha i upraszcza łańcuchy (RDP + filtracja)
+    Zwraca listę linii [(p0,p1), ...] gdzie p* to 3D numpy array.
+    """
+    # Wczesne warunki
+    if len(original_mesh.triangles) == 0:
+        return []
+
+    vertices = np.asarray(original_mesh.vertices, dtype=np.float64)
+    triangles = np.asarray(original_mesh.triangles, dtype=np.int32)
+
+    if len(original_mesh.triangle_normals) == 0:
+        original_mesh.compute_triangle_normals()
+    normals = np.asarray(original_mesh.triangle_normals, dtype=np.float64)
+    centers = np.mean(vertices[triangles], axis=1)
+
+    visible_mask = backface_culling(centers, normals, camera_pos, threshold)
+    visible_tris = triangles[visible_mask]
+
+    if len(visible_tris) == 0:
+        return []
+
+    # policz krawędzie i wybierz te graniczne
+    edge_counter = Counter()
+    for tri in visible_tris:
+        for i in range(3):
+            edge = tuple(sorted([int(tri[i]), int(tri[(i+1)%3])]))
+            edge_counter[edge] += 1
+    boundary_edges = [e for e, c in edge_counter.items() if c == 1]
+    if not boundary_edges:
+        return []
+
+    # połącz krawędzie w łańcuchy (zwraca listę list punktów 3D)
+    chains = chain_segments(boundary_edges, vertices)
+    if not chains:
+        return []
+
+    axes = get_projection_axes(view_dir)
+    simplified_chains = []
+
+    for chain in chains:
+        pts3 = np.array(chain)  # (N,3)
+        pts2 = pts3[:, axes]    # projekcja 2D
+
+        # filtracja małych elementów po powierzchni w rzucie 2D
+        bbox = pts2.max(axis=0) - pts2.min(axis=0)
+        if bbox[0] * bbox[1] < area:
+            continue
+
+        # uproszczenie RDP (zwracamy indeksy w oryginalnym łańcuchu)
+        idxs = _rdp_indices(pts2, epsilon)
+        if len(idxs) < 2:
+            continue
+
+        # policz długość uproszczonego łańcucha i odrzuć za krótki (szum)
+        total_len = 0.0
+        for i in range(len(idxs)-1):
+            total_len += np.linalg.norm(pts3[idxs[i+1]] - pts3[idxs[i]])
+        if total_len < min_noise:
+            continue
+
+        simp = [pts3[i].copy() for i in idxs]
+        # minimalnie: jeśli RDP zwróci zbyt mało punktów, zachowaj oryginalne
+        if len(simp) >= 2:
+            simplified_chains.append(simp)
+
+    if not simplified_chains:
+        return []
+
+    # konwersja łańcuchów na listę linii
+    lines = []
+    for ch in simplified_chains:
+        for i in range(len(ch)-1):
+            lines.append((ch[i], ch[i+1]))
+
+    # usuń artefakty (krótkie segmenty/łańcuchy)
+    lines = remove_artifacts(lines)
+    return lines
+
+def _edge_keys_from_tri_chunk(tri_chunk):
+    """
+    tri_chunk: (M,3) numpy array
+    Zwraca 1D numpy array dtype=np.uint64 z kluczami (min<<32 | max)
+    reprezentującymi posortowane pary wierzchołków.
+    """
+    if tri_chunk is None or tri_chunk.size == 0:
+        return np.empty(0, dtype=np.uint64)
+
+    # trzy zestawy krawędzi
+    e0 = tri_chunk[:, [0, 1]]
+    e1 = tri_chunk[:, [1, 2]]
+    e2 = tri_chunk[:, [2, 0]]
+    edges = np.vstack([e0, e1, e2])
+
+    # uporządkuj pary (min, max) i zbuduj 64-bitowy klucz
+    mins = np.minimum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+    maxs = np.maximum(edges[:, 0], edges[:, 1]).astype(np.uint64)
+    keys = (mins << np.uint64(32)) | maxs
+    return keys
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Użycie: python main.py <ścieżka_do_chmury_punktów>")
-        print("Opcjonalne parametry: [camera_x camera_y camera_z lookat_x lookat_y lookat_z]")
-        print("\nPrzykład:")
-        print("  python main.py cloud.las")
-        print("  python main.py cloud.ply 1.0 2.0 3.0 0.0 0.0 0.0")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description='Mesh -> Robot Path')
+    parser.add_argument('mesh_file', help='Plik meshu (.ply, .obj, .stl)')
+    parser.add_argument('--camera', nargs=3, type=float, metavar=('X', 'Y', 'Z'))
+    parser.add_argument('--target', nargs=3, type=float, metavar=('X', 'Y', 'Z'))
+    parser.add_argument('--dev', action='store_true', help='Tryb deweloperski')
+    parser.add_argument('--save-mesh', action='store_true', help='Zapisz przetworzony mesh do PLY')
+    parser.add_argument('--logo', choices=['min', 'full'], help='Dodaj logo (min lub full)')
+    args = parser.parse_args()
     
-    point_cloud_path = sys.argv[1]
+    cam = np.array(args.camera) if args.camera else None
+    target = np.array(args.target) if args.target else None
     
-    # Parsuj opcjonalne parametry kamery
-    camera_pos = None
-    look_at = None
+    if (cam is None) != (target is None):
+        sys.exit("Błąd: Podaj --camera i --target razem")
     
-    if len(sys.argv) >= 8:
-        try:
-            camera_pos = np.array([float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])])
-            look_at = np.array([float(sys.argv[5]), float(sys.argv[6]), float(sys.argv[7])])
-            print(f"Użyto podanej pozycji kamery: {camera_pos}")
-        except ValueError:
-            print("Błąd parsowania parametrów kamery - użycie wartości domyślnych")
-    
-    main(point_cloud_path, camera_pos, look_at)
+    main(args.mesh_file, cam, target, args.dev, args.save_mesh, args.logo)
